@@ -7,8 +7,8 @@
 
 use std::cmp;
 
-const MAX_HASHES: usize = 4;
-const MAX_SEGMENT_LENGTH_LOG: u32 = 18;
+const MAX_HASHES: usize = 16;
+const MAX_SEGMENT_LENGTH_LOG: u32 = 10;
 
 #[derive(Clone, Copy, Debug)]
 struct Layout {
@@ -18,11 +18,9 @@ struct Layout {
     array_length: usize,
 }
 
-/// Error returned when construction of the filter fails after several attempts.
+/// Error returned when construction of the filter fails.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BuildError {
-    /// The underlying randomised graph remained cyclic after many attempts.
-    CouldNotBuild,
     /// The provided configuration values are invalid.
     InvalidConfig(&'static str),
 }
@@ -32,20 +30,28 @@ pub enum BuildError {
 pub struct FilterConfig {
     /// Multiplicative overhead applied to the number of keys to estimate storage.
     pub overhead: f64,
-    /// Number of hash functions used by the filter (between 3 and 8).
+    /// Number of hash functions used by the filter (between 3 and 16).
     pub num_hashes: usize,
-    /// Number of attempts with different seeds before giving up on construction.
-    pub max_attempts: u32,
+    /// Seed used for hashing.
+    pub seed: u64,
 }
 
 impl Default for FilterConfig {
     fn default() -> Self {
         Self {
-            overhead: 1.23,
-            num_hashes: 3,
-            max_attempts: 64,
+            overhead: 1.0,
+            num_hashes: 8,
+            seed: 69,
         }
     }
+}
+
+/// Output of building a [`BinaryFuseFilter`].
+pub struct BuildOutput {
+    pub filter: BinaryFuseFilter,
+    pub abandoned_keys: Vec<u64>,
+    pub total_slots: usize,
+    pub actual_overhead: f64,
 }
 
 /// A static Binary Fuse filter for 64-bit keys.
@@ -58,36 +64,40 @@ pub struct BinaryFuseFilter {
 
 impl BinaryFuseFilter {
     /// Attempts to build a filter from the provided set of unique keys.
-    pub fn build(keys: &[u64]) -> Result<Self, BuildError> {
+    pub fn build(keys: &[u64]) -> Result<BuildOutput, BuildError> {
         Self::build_with_config(keys, &FilterConfig::default())
     }
 
     /// Builds a filter using the supplied configuration.
-    pub fn build_with_config(keys: &[u64], config: &FilterConfig) -> Result<Self, BuildError> {
+    pub fn build_with_config(
+        keys: &[u64],
+        config: &FilterConfig,
+    ) -> Result<BuildOutput, BuildError> {
         validate_config(config)?;
 
         let layout = calculate_layout(keys.len(), config)?;
         let array_len = layout.array_length;
 
         if keys.is_empty() {
-            return Ok(Self {
-                seed: 0,
-                num_hashes: config.num_hashes,
-                layout,
-                fingerprints: vec![0; array_len],
+            return Ok(BuildOutput {
+                filter: Self {
+                    seed: 0,
+                    num_hashes: config.num_hashes,
+                    layout,
+                    fingerprints: vec![0; array_len],
+                },
+                abandoned_keys: Vec::new(),
+                total_slots: array_len,
+                actual_overhead: 0.0,
             });
         }
 
-        let attempts = cmp::max(1, config.max_attempts);
-
-        for attempt in 0..attempts {
-            let seed = splitmix64(attempt as u64);
-            if let Some(filter) = Self::try_build_with_seed(keys, seed, config.num_hashes, layout) {
-                return Ok(filter);
-            }
-        }
-
-        Err(BuildError::CouldNotBuild)
+        Ok(Self::build_with_seed(
+            keys,
+            config.seed,
+            config.num_hashes,
+            layout,
+        ))
     }
 
     /// Returns true when `key` is (probably) in the set.
@@ -109,28 +119,37 @@ impl BinaryFuseFilter {
         fp == 0
     }
 
-    fn try_build_with_seed(
-        keys: &[u64],
-        seed: u64,
-        num_hashes: usize,
-        layout: Layout,
-    ) -> Option<Self> {
+    fn build_with_seed(keys: &[u64], seed: u64, num_hashes: usize, layout: Layout) -> BuildOutput {
         let array_len = layout.array_length;
         let mut degrees = vec![0u16; array_len];
-        let mut xors = vec![0u64; array_len];
+        let mut adjacency: Vec<Vec<usize>> = vec![Vec::new(); array_len];
         let mut idx_buf = [0usize; MAX_HASHES];
+        let mut key_infos = Vec::with_capacity(keys.len());
+        let mut active = vec![true; keys.len()];
 
-        for &key in keys {
+        struct KeyInfo {
+            hash: u64,
+            indexes: [usize; MAX_HASHES],
+        }
+
+        for (key_idx, &key) in keys.iter().enumerate() {
             let hash = mixsplit(key, seed);
             let indexes = fill_indexes(hash, num_hashes, layout, &mut idx_buf);
+            let mut stored = [0usize; MAX_HASHES];
+            stored[..num_hashes].copy_from_slice(indexes);
+            key_infos.push(KeyInfo {
+                hash,
+                indexes: stored,
+            });
             for &i in indexes {
                 degrees[i] = degrees[i].saturating_add(1);
-                xors[i] ^= hash;
+                adjacency[i].push(key_idx);
             }
         }
 
         let mut stack = Vec::with_capacity(keys.len());
         let mut queue = Vec::with_capacity(array_len);
+        let mut abandoned_keys = Vec::new();
 
         for i in 0..array_len {
             if degrees[i] == 1 {
@@ -138,58 +157,115 @@ impl BinaryFuseFilter {
             }
         }
 
-        while let Some(i) = queue.pop() {
-            if degrees[i] == 0 {
+        while stack.len() + abandoned_keys.len() < keys.len() {
+            let mut progress = false;
+
+            while let Some(cell) = queue.pop() {
+                if degrees[cell] == 0 {
+                    continue;
+                }
+
+                if let Some(&key_idx) = adjacency[cell].iter().find(|&&idx| active[idx]) {
+                    progress = true;
+                    active[key_idx] = false;
+                    stack.push((cell, key_idx));
+
+                    for &index in &key_infos[key_idx].indexes[..num_hashes] {
+                        if degrees[index] == 0 {
+                            continue;
+                        }
+                        degrees[index] -= 1;
+                        if degrees[index] == 1 {
+                            queue.push(index);
+                        }
+                    }
+                } else {
+                    degrees[cell] = 0;
+                }
+            }
+
+            if stack.len() + abandoned_keys.len() == keys.len() {
+                break;
+            }
+
+            if progress {
                 continue;
             }
 
-            let hash = xors[i];
-            stack.push((i, hash));
-
-            let indexes = fill_indexes(hash, num_hashes, layout, &mut idx_buf);
-            for &j in indexes {
-                if j == i || degrees[j] == 0 {
-                    continue;
-                }
-                degrees[j] -= 1;
-                xors[j] ^= hash;
-                if degrees[j] == 1 {
-                    queue.push(j);
+            // No degree-1 cells available, abandon a key from the least-populated cell.
+            let mut min_degree = u16::MAX;
+            let mut min_cell = None;
+            for (cell, &deg) in degrees.iter().enumerate() {
+                if deg > 1 && deg < min_degree {
+                    min_degree = deg;
+                    min_cell = Some(cell);
                 }
             }
 
-            degrees[i] = 0;
+            let Some(cell) = min_cell else {
+                break;
+            };
+
+            if let Some(&key_idx) = adjacency[cell].iter().find(|&&idx| active[idx]) {
+                active[key_idx] = false;
+                abandoned_keys.push(keys[key_idx]);
+
+                for &index in &key_infos[key_idx].indexes[..num_hashes] {
+                    if degrees[index] == 0 {
+                        continue;
+                    }
+                    degrees[index] -= 1;
+                    if degrees[index] == 1 {
+                        queue.push(index);
+                    }
+                }
+            } else {
+                degrees[cell] = 0;
+            }
         }
 
-        if stack.len() != keys.len() {
-            return None;
+        for (key_idx, is_active) in active.iter_mut().enumerate() {
+            if *is_active {
+                *is_active = false;
+                abandoned_keys.push(keys[key_idx]);
+            }
         }
 
         let mut fingerprints = vec![0u8; array_len];
-        while let Some((i, hash)) = stack.pop() {
+        while let Some((cell, key_idx)) = stack.pop() {
+            let key_info = &key_infos[key_idx];
+            let hash = key_info.hash;
             let mut value = fingerprint(hash);
-            let indexes = fill_indexes(hash, num_hashes, layout, &mut idx_buf);
-            for &j in indexes {
-                if j != i {
-                    value ^= fingerprints[j];
+            for &index in &key_info.indexes[..num_hashes] {
+                if index != cell {
+                    value ^= fingerprints[index];
                 }
             }
-            fingerprints[i] = value;
+            fingerprints[cell] = value;
         }
 
-        Some(Self {
-            seed,
-            num_hashes,
-            layout,
-            fingerprints,
-        })
+        BuildOutput {
+            filter: Self {
+                seed,
+                num_hashes,
+                layout,
+                fingerprints,
+            },
+            abandoned_keys,
+            total_slots: layout.array_length,
+            actual_overhead: if keys.is_empty() {
+                0.0
+            } else {
+                layout.array_length as f64 / keys.len() as f64
+            },
+        }
     }
 }
 
 fn validate_config(config: &FilterConfig) -> Result<(), BuildError> {
-    if config.num_hashes != 3 && config.num_hashes != 4 {
+    if !(3..=MAX_HASHES).contains(&config.num_hashes) {
         return Err(BuildError::InvalidConfig(
-            "num_hashes must be either 3 or 4 for binary fuse filters",
+            "num_hashes must be between 3 and 16",
         ));
     }
     if !(config.overhead > 0.0) {
@@ -202,25 +278,35 @@ fn validate_config(config: &FilterConfig) -> Result<(), BuildError> {
 
 fn calculate_layout(key_count: usize, config: &FilterConfig) -> Result<Layout, BuildError> {
     let num_hashes = config.num_hashes;
-    let mut segment_length = segment_length_for(num_hashes, key_count);
+    let target_slots = cmp::max(1, ((key_count as f64) * config.overhead).ceil() as usize);
+    let mut segment_length = segment_length_for(num_hashes, target_slots);
     if segment_length == 0 {
         segment_length = 1;
     }
     if segment_length > (1usize << MAX_SEGMENT_LENGTH_LOG) {
         segment_length = 1usize << MAX_SEGMENT_LENGTH_LOG;
     }
-    let size_factor = config.overhead.max(1.0);
-    let padding = cmp::max(8 * num_hashes, segment_length);
-    let capacity = key_count.saturating_add(padding).max(1);
-    let capacity = (capacity as f64 * size_factor).ceil() as usize;
-    let mut segment_count = (capacity + segment_length - 1) / segment_length;
-    if segment_count <= num_hashes - 1 {
-        segment_count = 1;
-    } else {
-        segment_count -= num_hashes - 1;
+    while segment_length > target_slots {
+        segment_length >>= 1;
+        if segment_length == 0 {
+            segment_length = 1;
+            break;
+        }
     }
+    let capacity = target_slots
+        .saturating_add(segment_length)
+        .max(target_slots);
+    let mut total_segments = (capacity + segment_length - 1) / segment_length;
+    if total_segments < num_hashes {
+        total_segments = num_hashes;
+    }
+    let mut segment_count = total_segments.saturating_sub(num_hashes - 1);
+    if segment_count == 0 {
+        segment_count = 1;
+    }
+    let total_segments_with_overlap = segment_count + num_hashes - 1;
     let array_length = segment_length
-        .checked_mul(segment_count + num_hashes - 1)
+        .checked_mul(total_segments_with_overlap)
         .ok_or(BuildError::InvalidConfig("filter size overflow"))?;
     let segment_count_length = segment_length
         .checked_mul(segment_count)
@@ -240,7 +326,11 @@ fn segment_length_for(num_hashes: usize, key_count: usize) -> usize {
     let shift = match num_hashes {
         3 => (log_size / 3.33_f64.ln() + 2.25).floor() as i32,
         4 => (log_size / 2.91_f64.ln() - 0.5).floor() as i32,
-        _ => 1,
+        n => {
+            let base = (2.91 - 0.22 * (n as f64 - 4.0)).max(1.8);
+            let offset = (-0.5 - 0.1 * (n as f64 - 4.0)).max(-3.5);
+            (log_size / base.ln() + offset).floor() as i32
+        }
     };
     let clamped = shift.clamp(1, MAX_SEGMENT_LENGTH_LOG as i32);
     1usize << clamped
@@ -282,7 +372,17 @@ fn fill_indexes<'a>(
             }
             &out[..4]
         }
-        _ => unreachable!("unsupported number of hashes"),
+        _ => {
+            let mut h = hash;
+            for (i, slot) in out.iter_mut().take(num_hashes).enumerate() {
+                let offset = (i as u64) * segment_length;
+                let variation = h & mask;
+                let index = (base + offset) ^ variation;
+                *slot = index as usize;
+                h = splitmix64(h);
+            }
+            &out[..num_hashes]
+        }
     }
 }
 
@@ -307,30 +407,40 @@ fn splitmix64(mut z: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     #[test]
     fn deterministic_membership() {
         let keys: Vec<u64> = (0..10_000).map(|i| i as u64 * 13_791).collect();
-        let filter = BinaryFuseFilter::build(&keys).expect("filter should build");
+        let build = BinaryFuseFilter::build(&keys).expect("filter should build");
+        let abandoned: HashSet<u64> = build.abandoned_keys.iter().copied().collect();
+        let filter = build.filter;
 
         for &k in &keys {
-            assert!(filter.contains(k), "missing key: {}", k);
+            if !abandoned.contains(&k) {
+                assert!(filter.contains(k), "missing key: {}", k);
+            }
         }
     }
 
     #[test]
     fn small_set() {
         let keys = [42_u64, 7, 1_000_000];
-        let filter = BinaryFuseFilter::build(&keys).unwrap();
+        let build = BinaryFuseFilter::build(&keys).unwrap();
+        let abandoned: HashSet<u64> = build.abandoned_keys.iter().copied().collect();
+        let filter = build.filter;
         for k in keys {
-            assert!(filter.contains(k));
+            if !abandoned.contains(&k) {
+                assert!(filter.contains(k));
+            }
         }
         assert!(!filter.contains(99));
     }
 
     #[test]
     fn empty_set() {
-        let filter = BinaryFuseFilter::build(&[]).unwrap();
+        let build = BinaryFuseFilter::build(&[]).unwrap();
+        let filter = build.filter;
         assert!(!filter.contains(123));
     }
 
@@ -340,13 +450,35 @@ mod tests {
         let config = FilterConfig {
             overhead: 1.35,
             num_hashes: 4,
-            max_attempts: 64,
+            seed: 42,
         };
-        let filter =
+        let build =
             BinaryFuseFilter::build_with_config(&keys, &config).expect("configurable filter");
+        assert!(build.actual_overhead >= config.overhead);
+        let filter = build.filter;
         for &k in &keys {
             assert!(filter.contains(k));
         }
         assert!(!filter.contains(999_999));
+    }
+
+    #[test]
+    fn higher_arity_support() {
+        let keys: Vec<u64> = (0..512).map(|i| i as u64 * 5_123).collect();
+        let config = FilterConfig {
+            overhead: 1.5,
+            num_hashes: 7,
+            seed: 123,
+        };
+        let build =
+            BinaryFuseFilter::build_with_config(&keys, &config).expect("higher arity filter");
+        let abandoned: HashSet<u64> = build.abandoned_keys.iter().copied().collect();
+        assert!(build.actual_overhead >= config.overhead);
+        let filter = build.filter;
+        for &k in &keys {
+            if !abandoned.contains(&k) {
+                assert!(filter.contains(k), "missing key: {}", k);
+            }
+        }
     }
 }

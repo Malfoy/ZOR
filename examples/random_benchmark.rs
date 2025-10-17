@@ -1,9 +1,8 @@
-use std::collections::HashSet;
 use std::env;
 use std::io::{self, Write};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -19,29 +18,31 @@ fn main() {
     let config = FilterConfig {
         overhead: cli.overhead,
         num_hashes: cli.num_hashes,
-        max_attempts: cli.max_attempts,
+        seed: cli.seed,
     };
 
     let runs = cli.runs;
     let key_count = cli.key_count;
-    let base_seed = cli.seed;
 
     let counter = Arc::new(AtomicU32::new(0));
-    let successes = Arc::new(AtomicU64::new(0));
-    let failures = Arc::new(AtomicU64::new(0));
+    let completed = Arc::new(AtomicU64::new(0));
+    let total_abandoned = Arc::new(AtomicU64::new(0));
+    let runs_with_abandoned = Arc::new(AtomicU64::new(0));
     let total_nanos = Arc::new(AtomicU64::new(0));
+    let total_actual_overhead = Arc::new(Mutex::new(0.0));
     let progress_done = Arc::new(AtomicBool::new(false));
 
     let mut handles = Vec::with_capacity(cli.threads);
     for worker_id in 0..cli.threads {
         let counter = Arc::clone(&counter);
-        let successes = Arc::clone(&successes);
-        let failures = Arc::clone(&failures);
+        let completed_runs = Arc::clone(&completed);
+        let total_abandoned = Arc::clone(&total_abandoned);
         let total_nanos = Arc::clone(&total_nanos);
+        let runs_with_abandoned = Arc::clone(&runs_with_abandoned);
+        let total_actual_overhead = Arc::clone(&total_actual_overhead);
         let config = config;
         let runs = runs;
         let key_count = key_count;
-        let base_seed = base_seed;
 
         let handle = thread::spawn(move || loop {
             let run = counter.fetch_add(1, Ordering::Relaxed);
@@ -49,30 +50,36 @@ fn main() {
                 break;
             }
 
-            let run_seed = derive_seed(base_seed, run as u64, worker_id as u64);
+            let run_seed = derive_seed(config.seed, run as u64, worker_id as u64);
             let mut generator = SplitMix64::new(run_seed);
             let keys = random_keys(key_count, &mut generator);
 
             let start = Instant::now();
-            match BinaryFuseFilter::build_with_config(&keys, &config) {
-                Ok(_) => {
-                    successes.fetch_add(1, Ordering::Relaxed);
-                    let elapsed = start.elapsed().as_nanos() as u64;
-                    total_nanos.fetch_add(elapsed, Ordering::Relaxed);
-                }
-                Err(_) => {
-                    failures.fetch_add(1, Ordering::Relaxed);
-                }
+            let build = BinaryFuseFilter::build_with_config(&keys, &config)
+                .expect("configuration should be valid");
+            let abandoned_count = build.abandoned_keys.len() as u64;
+            total_abandoned.fetch_add(abandoned_count, Ordering::Relaxed);
+            if abandoned_count > 0 {
+                runs_with_abandoned.fetch_add(1, Ordering::Relaxed);
             }
+            {
+                let mut guard = total_actual_overhead.lock().unwrap();
+                *guard += build.actual_overhead;
+            }
+            let elapsed = start.elapsed().as_nanos() as u64;
+            total_nanos.fetch_add(elapsed, Ordering::Relaxed);
+            completed_runs.fetch_add(1, Ordering::Relaxed);
         });
 
         handles.push(handle);
     }
 
     let progress_handle = {
-        let successes = Arc::clone(&successes);
-        let failures = Arc::clone(&failures);
+        let completed = Arc::clone(&completed);
+        let total_abandoned = Arc::clone(&total_abandoned);
+        let runs_with_abandoned = Arc::clone(&runs_with_abandoned);
         let progress_done = Arc::clone(&progress_done);
+        let total_actual_overhead = Arc::clone(&total_actual_overhead);
         thread::spawn(move || {
             let runs_total = runs as u64;
             loop {
@@ -80,29 +87,61 @@ fn main() {
                     break;
                 }
                 thread::sleep(Duration::from_secs(1));
-                let success_count = successes.load(Ordering::Relaxed);
-                let failure_count = failures.load(Ordering::Relaxed);
-                let completed = success_count + failure_count;
-                let success_rate = if completed == 0 {
+                let completed_runs = completed.load(Ordering::Relaxed);
+                let abandoned = total_abandoned.load(Ordering::Relaxed);
+                let runs_with_abandoned = runs_with_abandoned.load(Ordering::Relaxed);
+                let processed_keys = completed_runs * key_count as u64;
+                let mean_per_run = if completed_runs == 0 {
                     0.0
                 } else {
-                    (success_count as f64 / completed as f64) * 100.0
+                    abandoned as f64 / completed_runs as f64
                 };
-                print!("\rprogress: {completed}/{runs} runs ({success_rate:.2}% success)");
+                let avg_overhead = {
+                    let guard = total_actual_overhead.lock().unwrap();
+                    if completed_runs == 0 {
+                        0.0
+                    } else {
+                        *guard / completed_runs as f64
+                    }
+                };
+                print!(
+                    "\rprogress: {completed}/{runs} runs (abandoned total: {abandoned}, mean/run: {mean:.3}, runs with abandon: {with_abandon}, processed keys: {processed}, avg overhead: {overhead:.4})",
+                    completed = completed_runs,
+                    mean = mean_per_run,
+                    with_abandon = runs_with_abandoned,
+                    processed = processed_keys,
+                    overhead = avg_overhead
+                );
                 let _ = io::stdout().flush();
-                if completed >= runs_total {
+                if completed_runs >= runs_total {
                     break;
                 }
             }
-            let success_count = successes.load(Ordering::Relaxed);
-            let failure_count = failures.load(Ordering::Relaxed);
-            let completed = success_count + failure_count;
-            let success_rate = if completed == 0 {
+            let completed_runs = completed.load(Ordering::Relaxed);
+            let abandoned = total_abandoned.load(Ordering::Relaxed);
+            let runs_with_abandoned = runs_with_abandoned.load(Ordering::Relaxed);
+            let processed_keys = completed_runs * key_count as u64;
+            let mean_per_run = if completed_runs == 0 {
                 0.0
             } else {
-                (success_count as f64 / completed as f64) * 100.0
+                abandoned as f64 / completed_runs as f64
             };
-            println!("\rprogress: {completed}/{runs} runs ({success_rate:.2}% success)");
+            let avg_overhead = {
+                let guard = total_actual_overhead.lock().unwrap();
+                if completed_runs == 0 {
+                    0.0
+                } else {
+                    *guard / completed_runs as f64
+                }
+            };
+            println!(
+                "\rprogress: {completed}/{runs} runs (abandoned total: {abandoned}, mean/run: {mean:.3}, runs with abandon: {with_abandon}, processed keys: {processed}, avg overhead: {overhead:.4})",
+                completed = completed_runs,
+                mean = mean_per_run,
+                with_abandon = runs_with_abandoned,
+                processed = processed_keys,
+                overhead = avg_overhead
+            );
         })
     };
 
@@ -117,18 +156,33 @@ fn main() {
         eprintln!("progress reporter panicked: {:?}", err);
     }
 
-    let successes = successes.load(Ordering::Relaxed);
-    let failures = failures.load(Ordering::Relaxed);
+    let completed = completed.load(Ordering::Relaxed);
+    let abandoned_total = total_abandoned.load(Ordering::Relaxed);
+    let runs_with_abandoned = runs_with_abandoned.load(Ordering::Relaxed);
+    let aggregated_overhead = {
+        let guard = total_actual_overhead.lock().unwrap();
+        *guard
+    };
 
-    if successes > 0 {
+    if completed > 0 {
         let total_nanos = total_nanos.load(Ordering::Relaxed);
-        let mean = Duration::from_nanos(total_nanos / successes);
+        let mean = Duration::from_nanos(total_nanos / completed);
+        let total_keys = completed * key_count as u64;
+        let abandoned_rate = if total_keys == 0 {
+            0.0
+        } else {
+            abandoned_total as f64 / total_keys as f64
+        };
+        let mean_per_run = abandoned_total as f64 / completed as f64;
+        let avg_overhead = aggregated_overhead / completed as f64;
         println!(
-            "successful builds: {successes}, failed builds: {failures}, mean build time: {:?}",
+            "runs: {completed} | abandoned keys: {abandoned_total} total, {mean_per_run:.3} per run ({:.4}% of {} keys) | runs with abandoned keys: {runs_with_abandoned} | avg actual overhead: {avg_overhead:.4} | mean build time: {:?}",
+            abandoned_rate * 100.0,
+            total_keys,
             mean
         );
     } else {
-        println!("no successful builds (failed: {failures}), mean build time unavailable");
+        println!("no runs completed, mean build time unavailable");
     }
 }
 
@@ -138,7 +192,6 @@ struct Cli {
     overhead: f64,
     num_hashes: usize,
     runs: u32,
-    max_attempts: u32,
     seed: u64,
     threads: usize,
 }
@@ -146,11 +199,10 @@ struct Cli {
 impl Cli {
     fn from_env() -> Self {
         let mut cli = Self {
-            key_count: 1000_000,
-            overhead: 1.01,
-            num_hashes: 4,
+            key_count: 100_000,
+            overhead: 1.0,
+            num_hashes: 8,
             runs: 1000,
-            max_attempts: 1,
             seed: generate_seed(),
             threads: thread::available_parallelism()
                 .map(|n| n.get())
@@ -174,7 +226,6 @@ impl Cli {
                 "--overhead" => cli.overhead = parse(args.next(), "--overhead"),
                 "--hashes" => cli.num_hashes = parse(args.next(), "--hashes"),
                 "--runs" => cli.runs = parse(args.next(), "--runs"),
-                "--max-attempts" => cli.max_attempts = parse(args.next(), "--max-attempts"),
                 "--seed" => cli.seed = parse(args.next(), "--seed"),
                 "--threads" => cli.threads = parse(args.next(), "--threads"),
                 other => panic!("unknown flag: {other}"),
@@ -187,13 +238,13 @@ impl Cli {
 
 fn random_keys(count: usize, generator: &mut SplitMix64) -> Vec<u64> {
     let mut keys = Vec::with_capacity(count);
-    let mut seen = HashSet::with_capacity(count * 2);
+    // let mut seen = HashSet::with_capacity(count * 2);
 
     while keys.len() < count {
         let key = generator.next();
-        if seen.insert(key) {
-            keys.push(key);
-        }
+        // if seen.insert(key) {
+        keys.push(key);
+        // }
     }
 
     keys
