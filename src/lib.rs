@@ -5,8 +5,7 @@
 //! complete two-stage filter without false negatives using
 //! [`BinaryFuseFilter::build_complete`].
 
-use std::cmp::{self, Reverse};
-use std::collections::BinaryHeap;
+use std::cmp;
 use std::fmt;
 use std::mem;
 use std::ops::{BitXor, BitXorAssign};
@@ -210,23 +209,13 @@ where
         let array_len = layout.array_length;
         let mut degrees = vec![0u32; array_len];
         let mut idx_buf = [0usize; MAX_HASHES];
-        let mut key_infos = Vec::with_capacity(keys.len());
+        let mut hashes = Vec::with_capacity(keys.len());
         let mut active = vec![true; keys.len()];
-
-        struct KeyInfo {
-            hash: u64,
-            indexes: [usize; MAX_HASHES],
-        }
 
         for &key in keys {
             let hash = mixsplit(key, seed);
+            hashes.push(hash);
             let indexes = fill_indexes(hash, num_hashes, layout, &mut idx_buf);
-            let mut stored = [0usize; MAX_HASHES];
-            stored[..num_hashes].copy_from_slice(indexes);
-            key_infos.push(KeyInfo {
-                hash,
-                indexes: stored,
-            });
             for &i in indexes {
                 degrees[i] = degrees[i].saturating_add(1);
             }
@@ -240,13 +229,14 @@ where
         }
         adjacency_offsets[array_len] = total_edges;
 
-        let mut adjacency = vec![0usize; total_edges];
+        let mut adjacency = vec![0u32; total_edges];
         {
             let mut next_offset = adjacency_offsets[..array_len].to_vec();
-            for (key_idx, key_info) in key_infos.iter().enumerate() {
-                for &index in &key_info.indexes[..num_hashes] {
+            for (key_idx, &hash) in hashes.iter().enumerate() {
+                let indexes = fill_indexes(hash, num_hashes, layout, &mut idx_buf);
+                for &index in indexes {
                     let pos = next_offset[index];
-                    adjacency[pos] = key_idx;
+                    adjacency[pos] = key_idx as u32;
                     next_offset[index] += 1;
                 }
             }
@@ -254,13 +244,13 @@ where
 
         let mut stack = Vec::with_capacity(keys.len());
         let mut queue = Vec::with_capacity(array_len);
-        let mut min_heap: BinaryHeap<(Reverse<u32>, usize)> = BinaryHeap::with_capacity(array_len);
+        let mut multi_stack = Vec::with_capacity(array_len);
         let mut abandoned_keys = Vec::new();
 
         for i in 0..array_len {
             match degrees[i] {
                 1 => queue.push(i),
-                deg if deg > 1 => min_heap.push((Reverse(deg), i)),
+                deg if deg > 1 => multi_stack.push(i),
                 _ => {}
             }
         }
@@ -277,7 +267,7 @@ where
                 let end = adjacency_offsets[cell + 1];
                 let mut found_key = None;
                 for pos in start..end {
-                    let key_idx = adjacency[pos];
+                    let key_idx = adjacency[pos] as usize;
                     if active[key_idx] {
                         found_key = Some(key_idx);
                         break;
@@ -289,15 +279,16 @@ where
                     active[key_idx] = false;
                     stack.push((cell, key_idx));
 
-                    for &index in &key_infos[key_idx].indexes[..num_hashes] {
+                    let indexes = fill_indexes(hashes[key_idx], num_hashes, layout, &mut idx_buf);
+                    for &index in indexes {
                         if degrees[index] == 0 {
                             continue;
                         }
                         degrees[index] -= 1;
-                        match degrees[index] {
-                            1 => queue.push(index),
-                            deg if deg > 1 => min_heap.push((Reverse(deg), index)),
-                            _ => {}
+                        if degrees[index] == 1 {
+                            queue.push(index);
+                        } else if degrees[index] > 1 {
+                            multi_stack.push(index);
                         }
                     }
                 } else {
@@ -313,18 +304,13 @@ where
                 continue;
             }
 
-            // No degree-1 cells available, abandon a key from the least-populated cell.
+            // No degree-1 cells available, abandon a key from a multi-degree cell.
             let candidate = loop {
-                let Some((Reverse(stored_deg), cell)) = min_heap.peek().copied() else {
+                let Some(cell) = multi_stack.pop() else {
                     break None;
                 };
                 let current_deg = degrees[cell];
                 if current_deg <= 1 {
-                    min_heap.pop();
-                    continue;
-                }
-                if current_deg != stored_deg {
-                    min_heap.pop();
                     continue;
                 }
                 break Some(cell);
@@ -333,13 +319,12 @@ where
             let Some(cell) = candidate else {
                 break;
             };
-            min_heap.pop();
 
             let start = adjacency_offsets[cell];
             let end = adjacency_offsets[cell + 1];
             let mut found_key = None;
             for pos in start..end {
-                let key_idx = adjacency[pos];
+                let key_idx = adjacency[pos] as usize;
                 if active[key_idx] {
                     found_key = Some(key_idx);
                     break;
@@ -350,15 +335,16 @@ where
                 active[key_idx] = false;
                 abandoned_keys.push(keys[key_idx]);
 
-                for &index in &key_infos[key_idx].indexes[..num_hashes] {
+                let indexes = fill_indexes(hashes[key_idx], num_hashes, layout, &mut idx_buf);
+                for &index in indexes {
                     if degrees[index] == 0 {
                         continue;
                     }
                     degrees[index] -= 1;
-                    match degrees[index] {
-                        1 => queue.push(index),
-                        deg if deg > 1 => min_heap.push((Reverse(deg), index)),
-                        _ => {}
+                    if degrees[index] == 1 {
+                        queue.push(index);
+                    } else if degrees[index] > 1 {
+                        multi_stack.push(index);
                     }
                 }
             } else {
@@ -375,10 +361,10 @@ where
 
         let mut fingerprints = vec![F::default(); array_len];
         while let Some((cell, key_idx)) = stack.pop() {
-            let key_info = &key_infos[key_idx];
-            let hash = key_info.hash;
+            let hash = hashes[key_idx];
+            let indexes = fill_indexes(hash, num_hashes, layout, &mut idx_buf);
             let mut value = F::from_hash(hash);
-            for &index in &key_info.indexes[..num_hashes] {
+            for &index in indexes {
                 if index != cell {
                     value ^= fingerprints[index];
                 }
