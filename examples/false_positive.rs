@@ -1,18 +1,20 @@
 use std::collections::HashSet;
 use std::env;
+use std::sync::Arc;
+use std::thread;
 use std::time::Instant;
 
-use xor_filter::{BinaryFuseFilter, FilterConfig};
+use xor_filter::{BinaryFuseFilter, CompleteFilterConfig, FilterConfig};
 
 fn main() {
-    let key_count = 1_000_000;
-    let query_count = 1_000_000;
+    let key_count = 10_000_000;
+    let query_count = 10_000_000;
 
     let keys: Vec<u64> = (0..key_count).map(|i| i as u64 * 13_791).collect();
-    let mut key_set: HashSet<u64> = keys.iter().copied().collect();
+    let key_set: Arc<HashSet<u64>> = Arc::new(keys.iter().copied().collect());
 
-    let mut overhead = 1.05;
-    let mut num_hashes = 4;
+    let mut overhead = 1.0;
+    let mut num_hashes = 16;
     let mut seed = 0_u64;
 
     let mut args = env::args().skip(1);
@@ -35,73 +37,276 @@ fn main() {
         }
     }
 
-    let config = FilterConfig {
+    let main_config = FilterConfig {
         overhead,
         num_hashes,
         seed,
     };
+    let remainder_overhead = overhead.max(1.1);
+    let remainder_config = FilterConfig {
+        overhead: remainder_overhead,
+        num_hashes,
+        seed: seed ^ 0xD6E8_FEB8_6659_FD93,
+    };
+    let complete_config = CompleteFilterConfig {
+        main: main_config,
+        remainder: remainder_config,
+    };
 
     let build_start = Instant::now();
-    let build = BinaryFuseFilter::build_with_config(&keys, &config).expect("filter should build");
-    let abandoned = build.abandoned_keys;
-    let filter = build.filter;
-    let build_time = build_start.elapsed();
-    println!("actual overhead used: {:.6}", build.actual_overhead);
+    let build_8_16 = BinaryFuseFilter::build_complete_8_16_with_config(&keys, &complete_config)
+        .expect("8/16 filter should build");
+    let build_time_8_16 = build_start.elapsed();
+    evaluate_variant(
+        "8/16",
+        build_8_16,
+        build_time_8_16,
+        &keys,
+        &key_set,
+        query_count,
+    );
 
-    let abandoned_set: HashSet<u64> = abandoned.iter().copied().collect();
-    for key in &abandoned_set {
-        key_set.remove(key);
+    println!();
+
+    let build_start = Instant::now();
+    let build_16_32 = BinaryFuseFilter::build_complete_16_32_with_config(&keys, &complete_config)
+        .expect("16/32 filter should build");
+    let build_time_16_32 = build_start.elapsed();
+    evaluate_variant(
+        "16/32",
+        build_16_32,
+        build_time_16_32,
+        &keys,
+        &key_set,
+        query_count,
+    );
+}
+
+fn evaluate_variant<MainFp, RemFp>(
+    label: &str,
+    build: xor_filter::CompleteBuildOutput<MainFp, RemFp>,
+    build_time: std::time::Duration,
+    keys: &[u64],
+    key_set: &Arc<HashSet<u64>>,
+    query_count: usize,
+) where
+    MainFp: xor_filter::FingerprintValue + Send + Sync + 'static,
+    RemFp: xor_filter::FingerprintValue + Send + Sync + 'static,
+{
+    let xor_filter::CompleteBuildOutput {
+        filter,
+        main_abandoned_keys,
+        remainder_abandoned_keys,
+        fallback_key_count,
+        main_total_slots,
+        main_actual_overhead,
+        remainder_total_slots,
+        remainder_actual_overhead,
+        main_build_time,
+        remainder_build_time,
+        total_bytes,
+        bytes_per_key,
+    } = build;
+
+    let key_count = keys.len();
+    let zor_bits = std::mem::size_of::<MainFp>() * 8;
+    let remainder_bits = std::mem::size_of::<RemFp>() * 8;
+
+    println!("=== Variant {label} ===");
+    println!("Configuration: ZOR {zor_bits} bits | remainder {remainder_bits} bits");
+    println!("built filter for {key_count} keys in {:?}", build_time);
+    println!("main build time: {:?}", main_build_time);
+    println!("remainder build time: {:?}", remainder_build_time);
+    let main_overhead_pct = if main_actual_overhead >= 1.0 {
+        (main_actual_overhead - 1.0) * 100.0
+    } else {
+        0.0
+    };
+    println!(
+        "main actual overhead used: {:.6} ({:.2}%) across {main_total_slots} slots",
+        main_actual_overhead, main_overhead_pct
+    );
+    if let Some(overhead) = remainder_actual_overhead {
+        let remainder_overhead_pct = if overhead >= 1.0 {
+            (overhead - 1.0) * 100.0
+        } else {
+            0.0
+        };
+        if let Some(slots) = remainder_total_slots {
+            println!(
+                "remainder actual overhead used: {:.6} ({:.2}%) across {slots} slots",
+                overhead, remainder_overhead_pct
+            );
+        } else {
+            println!(
+                "remainder actual overhead used: {:.6} ({:.2}%)",
+                overhead, remainder_overhead_pct
+            );
+        }
+    } else {
+        println!("remainder filter not constructed (no abandoned keys)");
     }
+    println!("main abandoned keys: {}", main_abandoned_keys.len());
+    println!(
+        "remainder abandoned keys: {}",
+        remainder_abandoned_keys.len()
+    );
+    println!("fallback keys stored exactly: {}", fallback_key_count);
+    println!(
+        "total bytes used: {} (bytes per key: {:.6})",
+        total_bytes, bytes_per_key
+    );
 
+    assert!(
+        remainder_abandoned_keys.is_empty(),
+        "remainder layer should not abandon keys"
+    );
+    assert!(
+        fallback_key_count == 0,
+        "fallback storage should remain empty when remainder succeeds"
+    );
+
+    let filter = Arc::new(filter);
     let mut false_negatives = 0usize;
-    let mut false_negatives_ex_abandoned = 0usize;
-    for &key in &keys {
+    for &key in keys {
         if !filter.contains(key) {
             false_negatives += 1;
-            if !abandoned_set.contains(&key) {
-                false_negatives_ex_abandoned += 1;
-            }
         }
     }
     assert!(
-        false_negatives_ex_abandoned == 0,
-        "filter missed {false_negatives_ex_abandoned} non-abandoned keys"
+        false_negatives == 0,
+        "filter missed {false_negatives} keys despite completion"
     );
-
-    if !abandoned.is_empty() {
-        eprintln!(
-            "warning: {count} keys were abandoned during construction",
-            count = abandoned.len()
-        );
-    }
-
-    let mut generator = SplitMix64::new(0xDEADBEEF);
-    let mut false_positives = 0_u64;
-
-    for _ in 0..query_count {
-        let key = generator.next();
-        if filter.contains(key) {
-            if !key_set.contains(&key) {
-                false_positives += 1;
-            }
-        }
-    }
-
-    let fp_rate = false_positives as f64 / query_count as f64;
-    let abandoned_rate = abandoned.len() as f64 / key_count as f64;
     let false_negative_rate = false_negatives as f64 / key_count as f64;
-
-    println!("built filter for {key_count} keys in {:?}", build_time);
-    println!("false positive rate: {:.3}%", fp_rate * 100.0);
     println!(
         "False negatives: {false_negatives} ({:.3}%)",
         false_negative_rate * 100.0
     );
+
+    let mut generator = SplitMix64::new(0xDEADBEEF);
+    let mut false_positives = 0_u64;
+    let key_set_ref = key_set.as_ref();
+    let single_start = Instant::now();
+    for _ in 0..query_count {
+        let key = generator.next();
+        if filter.contains(key) && !key_set_ref.contains(&key) {
+            false_positives += 1;
+        }
+    }
+    let single_duration = single_start.elapsed();
+    let single_seconds = single_duration.as_secs_f64();
+    let single_qps = if single_seconds > 0.0 {
+        query_count as f64 / single_seconds
+    } else {
+        query_count as f64
+    };
+    let fp_rate = if query_count == 0 {
+        0.0
+    } else {
+        false_positives as f64 / query_count as f64
+    };
     println!(
-        "abandoned keys: {} ({:.3}%)",
-        abandoned.len(),
-        abandoned_rate * 100.0
+        "single-thread query time: {:?} ({:.3} Mquery/s)",
+        single_duration,
+        single_qps / 1_000_000.0
     );
+    println!("single-thread queries per second: {:.2}", single_qps);
+    println!(
+        "single-thread false positives: {false_positives} ({:.3}%)",
+        fp_rate * 100.0
+    );
+
+    let available_threads = thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let mut multi_threads = available_threads.max(2);
+    if query_count == 0 {
+        multi_threads = 0;
+    } else if multi_threads > query_count {
+        multi_threads = query_count;
+    }
+    if multi_threads < 2 {
+        println!("multi-thread query run skipped (insufficient threads or queries)");
+    } else {
+        let per_thread = query_count / multi_threads;
+        let extra = query_count % multi_threads;
+        let mut handles = Vec::with_capacity(multi_threads);
+        let multi_start = Instant::now();
+        for idx in 0..multi_threads {
+            let quota = per_thread + if idx < extra { 1 } else { 0 };
+            if quota == 0 {
+                continue;
+            }
+            let filter_clone = Arc::clone(&filter);
+            let key_set_clone = Arc::clone(key_set);
+            handles.push(thread::spawn(move || {
+                let seed = 0xDEADBEEFu64 ^ ((idx as u64 + 1).wrapping_mul(0x9E3779B97F4A7C15));
+                let mut generator = SplitMix64::new(seed);
+                let mut local_fp = 0_u64;
+                for _ in 0..quota {
+                    let key = generator.next();
+                    if filter_clone.contains(key) && !key_set_clone.contains(&key) {
+                        local_fp += 1;
+                    }
+                }
+                local_fp
+            }));
+        }
+        let mut multi_false_positives = 0_u64;
+        for handle in handles {
+            multi_false_positives += handle.join().unwrap();
+        }
+        let multi_duration = multi_start.elapsed();
+        let multi_seconds = multi_duration.as_secs_f64();
+        let multi_qps = if multi_seconds > 0.0 {
+            query_count as f64 / multi_seconds
+        } else {
+            query_count as f64
+        };
+        let multi_fp_rate = if query_count == 0 {
+            0.0
+        } else {
+            multi_false_positives as f64 / query_count as f64
+        };
+        let speedup = if single_qps > 0.0 {
+            multi_qps / single_qps
+        } else {
+            0.0
+        };
+        println!(
+            "multi-thread ({multi_threads} threads) query time: {:?} ({:.3} Mquery/s)",
+            multi_duration,
+            multi_qps / 1_000_000.0
+        );
+        println!("multi-thread queries per second: {:.2}", multi_qps);
+        println!(
+            "multi-thread false positives: {multi_false_positives} ({:.3}%)",
+            multi_fp_rate * 100.0
+        );
+        println!("speedup vs single-thread: {:.2}x", speedup);
+    }
+
+    if fp_rate > 0.0 {
+        let optimal_bits = (1.0 / fp_rate).log2();
+        if optimal_bits.is_finite() && optimal_bits > 0.0 {
+            let optimal_bytes = optimal_bits / 8.0;
+            let overhead_factor = bytes_per_key / optimal_bytes;
+            let overhead_pct = (overhead_factor - 1.0) * 100.0;
+            println!("optimal bits per key: {:.6}", optimal_bits);
+            println!("optimal bytes per key: {:.6}", optimal_bytes);
+            println!(
+                "memory overhead vs optimal: {:.6}x ({:.2}%)",
+                overhead_factor, overhead_pct
+            );
+        } else {
+            println!(
+                "optimal cost undefined for false positive rate {:.3}%",
+                fp_rate * 100.0
+            );
+        }
+    } else {
+        println!("no false positives observed; optimal cost undefined");
+    }
 }
 
 struct SplitMix64 {

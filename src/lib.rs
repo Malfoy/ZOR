@@ -1,14 +1,20 @@
-//! Binary Fuse filter implementation for 64-bit keys.
+//! Binary Fuse filter implementation for 64-bit keys with optional remainder filter support.
 //!
-//! This filter offers fast membership queries with low memory usage and
-//! configurable arity. Construct it from a collection of unique keys with
-//! [`BinaryFuseFilter::build`] and query membership using
-//! [`BinaryFuseFilter::contains`].
+//! The base filter offers fast membership queries with low memory usage and configurable arity.
+//! Construct it from a collection of unique keys with [`BinaryFuseFilter::build`], or build a
+//! complete two-stage filter without false negatives using
+//! [`BinaryFuseFilter::build_complete`].
 
-use std::cmp;
+use std::cmp::{self, Reverse};
+use std::collections::BinaryHeap;
+use std::fmt;
+use std::mem;
+use std::ops::{BitXor, BitXorAssign};
+use std::time::{Duration, Instant};
 
 const MAX_HASHES: usize = 16;
 const MAX_SEGMENT_LENGTH_LOG: u32 = 10;
+const MAX_BINARY_FUSE_ATTEMPTS: usize = 32;
 
 #[derive(Clone, Copy, Debug)]
 struct Layout {
@@ -23,6 +29,8 @@ struct Layout {
 pub enum BuildError {
     /// The provided configuration values are invalid.
     InvalidConfig(&'static str),
+    /// Construction failed after exhausting retries.
+    ConstructionFailed(&'static str),
 }
 
 /// Configuration options for building a [`BinaryFuseFilter`].
@@ -46,33 +54,107 @@ impl Default for FilterConfig {
     }
 }
 
+/// Configuration for [`BinaryFuseFilter::build_complete`].
+#[derive(Clone, Copy, Debug)]
+pub struct CompleteFilterConfig {
+    /// Configuration for the main 8-bit fingerprint filter.
+    pub main: FilterConfig,
+    /// Configuration for the remainder 16-bit fingerprint filter.
+    pub remainder: FilterConfig,
+}
+
+impl Default for CompleteFilterConfig {
+    fn default() -> Self {
+        let main = FilterConfig::default();
+        let remainder = FilterConfig {
+            overhead: main.overhead.max(1.1),
+            seed: main.seed ^ 0xD6E8_FEB8_6659_FD93,
+            num_hashes: main.num_hashes,
+        };
+        Self { main, remainder }
+    }
+}
+
 /// Output of building a [`BinaryFuseFilter`].
-pub struct BuildOutput {
-    pub filter: BinaryFuseFilter,
+pub struct BuildOutput<Fingerprint = u8> {
+    pub filter: BinaryFuseFilter<Fingerprint>,
     pub abandoned_keys: Vec<u64>,
     pub total_slots: usize,
     pub actual_overhead: f64,
 }
 
-/// A static Binary Fuse filter for 64-bit keys.
-pub struct BinaryFuseFilter {
+/// Output of building a complete two-stage filter with [`BinaryFuseFilter::build_complete_8_16`]
+/// or [`BinaryFuseFilter::build_complete_16_32`].
+pub struct CompleteBuildOutput<MainFp = u8, RemFp = u16> {
+    pub filter: CompleteFilter<MainFp, RemFp>,
+    pub main_abandoned_keys: Vec<u64>,
+    pub remainder_abandoned_keys: Vec<u64>,
+    pub fallback_key_count: usize,
+    pub main_total_slots: usize,
+    pub main_actual_overhead: f64,
+    pub remainder_total_slots: Option<usize>,
+    pub remainder_actual_overhead: Option<f64>,
+    pub main_build_time: Duration,
+    pub remainder_build_time: Duration,
+    pub total_bytes: usize,
+    pub bytes_per_key: f64,
+}
+
+pub type CompleteBuildOutput8_16 = CompleteBuildOutput<u8, u16>;
+pub type CompleteBuildOutput16_32 = CompleteBuildOutput<u16, u32>;
+
+/// A static Binary Fuse filter for 64-bit keys parameterized over fingerprint width.
+pub struct BinaryFuseFilter<Fingerprint = u8> {
     seed: u64,
     num_hashes: usize,
     layout: Layout,
-    fingerprints: Vec<u8>,
+    fingerprints: Vec<Fingerprint>,
 }
 
-impl BinaryFuseFilter {
-    /// Attempts to build a filter from the provided set of unique keys.
-    pub fn build(keys: &[u64]) -> Result<BuildOutput, BuildError> {
-        Self::build_with_config(keys, &FilterConfig::default())
-    }
+/// A composed filter made of a main Binary Fuse filter and an optional remainder filter augmented
+/// with exact fallback storage.
+pub struct CompleteFilter<MainFp = u8, RemFp = u16> {
+    main: BinaryFuseFilter<MainFp>,
+    remainder: Option<BinaryFuseFilter<RemFp>>,
+    fallback_keys: Vec<u64>,
+}
 
-    /// Builds a filter using the supplied configuration.
-    pub fn build_with_config(
-        keys: &[u64],
-        config: &FilterConfig,
-    ) -> Result<BuildOutput, BuildError> {
+pub type CompleteFilter8_16 = CompleteFilter<u8, u16>;
+pub type CompleteFilter16_32 = CompleteFilter<u16, u32>;
+
+pub trait FingerprintValue:
+    Copy + Default + PartialEq + BitXor<Output = Self> + BitXorAssign + fmt::Debug + 'static
+{
+    fn from_hash(hash: u64) -> Self;
+}
+
+impl FingerprintValue for u8 {
+    #[inline]
+    fn from_hash(hash: u64) -> Self {
+        hash as u8
+    }
+}
+
+impl FingerprintValue for u16 {
+    #[inline]
+    fn from_hash(hash: u64) -> Self {
+        hash as u16
+    }
+}
+
+impl FingerprintValue for u32 {
+    #[inline]
+    fn from_hash(hash: u64) -> Self {
+        hash as u32
+    }
+}
+
+#[allow(private_bounds)]
+impl<F> BinaryFuseFilter<F>
+where
+    F: FingerprintValue,
+{
+    fn build_internal(keys: &[u64], config: &FilterConfig) -> Result<BuildOutput<F>, BuildError> {
         validate_config(config)?;
 
         let layout = calculate_layout(keys.len(), config)?;
@@ -84,7 +166,7 @@ impl BinaryFuseFilter {
                     seed: 0,
                     num_hashes: config.num_hashes,
                     layout,
-                    fingerprints: vec![0; array_len],
+                    fingerprints: vec![F::default(); array_len],
                 },
                 abandoned_keys: Vec::new(),
                 total_slots: array_len,
@@ -111,18 +193,22 @@ impl BinaryFuseFilter {
         let mut idx_buf = [0usize; MAX_HASHES];
         let indexes = fill_indexes(hash, self.num_hashes, self.layout, &mut idx_buf);
 
-        let mut fp = fingerprint(hash);
+        let mut fp = F::from_hash(hash);
         for &i in indexes {
             fp ^= self.fingerprints[i];
         }
 
-        fp == 0
+        fp == F::default()
     }
 
-    fn build_with_seed(keys: &[u64], seed: u64, num_hashes: usize, layout: Layout) -> BuildOutput {
+    fn build_with_seed(
+        keys: &[u64],
+        seed: u64,
+        num_hashes: usize,
+        layout: Layout,
+    ) -> BuildOutput<F> {
         let array_len = layout.array_length;
-        let mut degrees = vec![0u16; array_len];
-        let mut adjacency: Vec<Vec<usize>> = vec![Vec::new(); array_len];
+        let mut degrees = vec![0u32; array_len];
         let mut idx_buf = [0usize; MAX_HASHES];
         let mut key_infos = Vec::with_capacity(keys.len());
         let mut active = vec![true; keys.len()];
@@ -132,7 +218,7 @@ impl BinaryFuseFilter {
             indexes: [usize; MAX_HASHES],
         }
 
-        for (key_idx, &key) in keys.iter().enumerate() {
+        for &key in keys {
             let hash = mixsplit(key, seed);
             let indexes = fill_indexes(hash, num_hashes, layout, &mut idx_buf);
             let mut stored = [0usize; MAX_HASHES];
@@ -143,17 +229,39 @@ impl BinaryFuseFilter {
             });
             for &i in indexes {
                 degrees[i] = degrees[i].saturating_add(1);
-                adjacency[i].push(key_idx);
+            }
+        }
+
+        let mut adjacency_offsets = vec![0usize; array_len + 1];
+        let mut total_edges = 0usize;
+        for (slot, &degree) in degrees.iter().enumerate() {
+            adjacency_offsets[slot] = total_edges;
+            total_edges += degree as usize;
+        }
+        adjacency_offsets[array_len] = total_edges;
+
+        let mut adjacency = vec![0usize; total_edges];
+        {
+            let mut next_offset = adjacency_offsets[..array_len].to_vec();
+            for (key_idx, key_info) in key_infos.iter().enumerate() {
+                for &index in &key_info.indexes[..num_hashes] {
+                    let pos = next_offset[index];
+                    adjacency[pos] = key_idx;
+                    next_offset[index] += 1;
+                }
             }
         }
 
         let mut stack = Vec::with_capacity(keys.len());
         let mut queue = Vec::with_capacity(array_len);
+        let mut min_heap: BinaryHeap<(Reverse<u32>, usize)> = BinaryHeap::with_capacity(array_len);
         let mut abandoned_keys = Vec::new();
 
         for i in 0..array_len {
-            if degrees[i] == 1 {
-                queue.push(i);
+            match degrees[i] {
+                1 => queue.push(i),
+                deg if deg > 1 => min_heap.push((Reverse(deg), i)),
+                _ => {}
             }
         }
 
@@ -165,7 +273,18 @@ impl BinaryFuseFilter {
                     continue;
                 }
 
-                if let Some(&key_idx) = adjacency[cell].iter().find(|&&idx| active[idx]) {
+                let start = adjacency_offsets[cell];
+                let end = adjacency_offsets[cell + 1];
+                let mut found_key = None;
+                for pos in start..end {
+                    let key_idx = adjacency[pos];
+                    if active[key_idx] {
+                        found_key = Some(key_idx);
+                        break;
+                    }
+                }
+
+                if let Some(key_idx) = found_key {
                     progress = true;
                     active[key_idx] = false;
                     stack.push((cell, key_idx));
@@ -175,8 +294,10 @@ impl BinaryFuseFilter {
                             continue;
                         }
                         degrees[index] -= 1;
-                        if degrees[index] == 1 {
-                            queue.push(index);
+                        match degrees[index] {
+                            1 => queue.push(index),
+                            deg if deg > 1 => min_heap.push((Reverse(deg), index)),
+                            _ => {}
                         }
                     }
                 } else {
@@ -193,20 +314,39 @@ impl BinaryFuseFilter {
             }
 
             // No degree-1 cells available, abandon a key from the least-populated cell.
-            let mut min_degree = u16::MAX;
-            let mut min_cell = None;
-            for (cell, &deg) in degrees.iter().enumerate() {
-                if deg > 1 && deg < min_degree {
-                    min_degree = deg;
-                    min_cell = Some(cell);
+            let candidate = loop {
+                let Some((Reverse(stored_deg), cell)) = min_heap.peek().copied() else {
+                    break None;
+                };
+                let current_deg = degrees[cell];
+                if current_deg <= 1 {
+                    min_heap.pop();
+                    continue;
+                }
+                if current_deg != stored_deg {
+                    min_heap.pop();
+                    continue;
+                }
+                break Some(cell);
+            };
+
+            let Some(cell) = candidate else {
+                break;
+            };
+            min_heap.pop();
+
+            let start = adjacency_offsets[cell];
+            let end = adjacency_offsets[cell + 1];
+            let mut found_key = None;
+            for pos in start..end {
+                let key_idx = adjacency[pos];
+                if active[key_idx] {
+                    found_key = Some(key_idx);
+                    break;
                 }
             }
 
-            let Some(cell) = min_cell else {
-                break;
-            };
-
-            if let Some(&key_idx) = adjacency[cell].iter().find(|&&idx| active[idx]) {
+            if let Some(key_idx) = found_key {
                 active[key_idx] = false;
                 abandoned_keys.push(keys[key_idx]);
 
@@ -215,8 +355,10 @@ impl BinaryFuseFilter {
                         continue;
                     }
                     degrees[index] -= 1;
-                    if degrees[index] == 1 {
-                        queue.push(index);
+                    match degrees[index] {
+                        1 => queue.push(index),
+                        deg if deg > 1 => min_heap.push((Reverse(deg), index)),
+                        _ => {}
                     }
                 }
             } else {
@@ -231,11 +373,11 @@ impl BinaryFuseFilter {
             }
         }
 
-        let mut fingerprints = vec![0u8; array_len];
+        let mut fingerprints = vec![F::default(); array_len];
         while let Some((cell, key_idx)) = stack.pop() {
             let key_info = &key_infos[key_idx];
             let hash = key_info.hash;
-            let mut value = fingerprint(hash);
+            let mut value = F::from_hash(hash);
             for &index in &key_info.indexes[..num_hashes] {
                 if index != cell {
                     value ^= fingerprints[index];
@@ -259,6 +401,250 @@ impl BinaryFuseFilter {
                 layout.array_length as f64 / keys.len() as f64
             },
         }
+    }
+}
+
+impl BinaryFuseFilter {
+    /// Attempts to build an 8-bit fingerprint filter from the provided set of unique keys.
+    pub fn build(keys: &[u64]) -> Result<BuildOutput, BuildError> {
+        Self::build_internal(keys, &FilterConfig::default())
+    }
+
+    /// Builds an 8-bit fingerprint filter using the supplied configuration.
+    pub fn build_with_config(
+        keys: &[u64],
+        config: &FilterConfig,
+    ) -> Result<BuildOutput, BuildError> {
+        Self::build_internal(keys, config)
+    }
+
+    /// Builds a complete two-stage filter (8-bit main / 16-bit remainder) that eliminates false negatives.
+    pub fn build_complete(keys: &[u64]) -> Result<CompleteBuildOutput8_16, BuildError> {
+        Self::build_complete_8_16_with_config(keys, &CompleteFilterConfig::default())
+    }
+
+    /// Builds a complete two-stage filter (8-bit main / 16-bit remainder) using the supplied configuration.
+    pub fn build_complete_with_config(
+        keys: &[u64],
+        config: &CompleteFilterConfig,
+    ) -> Result<CompleteBuildOutput8_16, BuildError> {
+        Self::build_complete_8_16_with_config(keys, config)
+    }
+
+    /// Builds a complete two-stage filter with 8-bit ZOR layer and 16-bit remainder.
+    pub fn build_complete_8_16(keys: &[u64]) -> Result<CompleteBuildOutput8_16, BuildError> {
+        Self::build_complete_8_16_with_config(keys, &CompleteFilterConfig::default())
+    }
+
+    /// Builds a complete two-stage filter with 8-bit ZOR layer and 16-bit remainder using configuration.
+    pub fn build_complete_8_16_with_config(
+        keys: &[u64],
+        config: &CompleteFilterConfig,
+    ) -> Result<CompleteBuildOutput8_16, BuildError> {
+        build_complete_generic::<u8, u16>(keys, config)
+    }
+
+    /// Builds a complete two-stage filter with 16-bit ZOR layer and 32-bit remainder.
+    pub fn build_complete_16_32(keys: &[u64]) -> Result<CompleteBuildOutput16_32, BuildError> {
+        Self::build_complete_16_32_with_config(keys, &CompleteFilterConfig::default())
+    }
+
+    /// Builds a complete two-stage filter with 16-bit ZOR layer and 32-bit remainder using configuration.
+    pub fn build_complete_16_32_with_config(
+        keys: &[u64],
+        config: &CompleteFilterConfig,
+    ) -> Result<CompleteBuildOutput16_32, BuildError> {
+        build_complete_generic::<u16, u32>(keys, config)
+    }
+}
+
+impl<F> BinaryFuseFilter<F>
+where
+    F: FingerprintValue,
+{
+    fn build_lossless_with_config(
+        keys: &[u64],
+        config: &FilterConfig,
+    ) -> Result<BuildOutput<F>, BuildError> {
+        validate_config(config)?;
+
+        if keys.is_empty() {
+            let layout = calculate_layout(0, config)?;
+            return Ok(BuildOutput {
+                filter: BinaryFuseFilter {
+                    seed: 0,
+                    num_hashes: config.num_hashes,
+                    layout,
+                    fingerprints: Vec::new(),
+                },
+                abandoned_keys: Vec::new(),
+                total_slots: layout.array_length,
+                actual_overhead: 0.0,
+            });
+        }
+
+        let mut attempt_seed = config.seed;
+        let mut overhead = config.overhead.max(1.1);
+
+        for attempt in 0..MAX_BINARY_FUSE_ATTEMPTS {
+            if attempt > 0 {
+                overhead *= 1.1;
+                attempt_seed = splitmix64(attempt_seed);
+            }
+            let attempt_config = FilterConfig {
+                overhead,
+                num_hashes: config.num_hashes,
+                seed: attempt_seed,
+            };
+            let layout = calculate_layout(keys.len(), &attempt_config)?;
+            let build = BinaryFuseFilter::build_with_seed(
+                keys,
+                attempt_config.seed,
+                attempt_config.num_hashes,
+                layout,
+            );
+            if build.abandoned_keys.is_empty() {
+                return Ok(build);
+            }
+        }
+
+        Err(BuildError::ConstructionFailed(
+            "binary fuse remainder failed to build without abandoned keys",
+        ))
+    }
+}
+
+fn build_complete_generic<MainFp, RemFp>(
+    keys: &[u64],
+    config: &CompleteFilterConfig,
+) -> Result<CompleteBuildOutput<MainFp, RemFp>, BuildError>
+where
+    MainFp: FingerprintValue,
+    RemFp: FingerprintValue,
+{
+    let main_start = Instant::now();
+    let main_build = BinaryFuseFilter::<MainFp>::build_internal(keys, &config.main)?;
+    let main_build_time = main_start.elapsed();
+
+    let BuildOutput {
+        filter: main_filter,
+        abandoned_keys: main_abandoned_keys,
+        total_slots: main_total_slots,
+        actual_overhead: main_actual_overhead,
+    } = main_build;
+
+    let mut total_bytes = main_total_slots * mem::size_of::<MainFp>();
+
+    let mut remainder_candidates = Vec::with_capacity(main_abandoned_keys.len());
+    for &key in &main_abandoned_keys {
+        if !main_filter.contains(key) {
+            remainder_candidates.push(key);
+        }
+    }
+
+    let mut fallback_keys = Vec::new();
+    let mut remainder_abandoned_keys = Vec::new();
+    let mut remainder_total_slots = None;
+    let mut remainder_actual_overhead = None;
+    let mut remainder_build_time = Duration::default();
+    let remainder_filter = if remainder_candidates.is_empty() {
+        None
+    } else {
+        let adjusted_remainder_config = FilterConfig {
+            overhead: config.remainder.overhead.max(1.1),
+            ..config.remainder
+        };
+        let remainder_start = Instant::now();
+        let remainder_build = BinaryFuseFilter::<RemFp>::build_lossless_with_config(
+            &remainder_candidates,
+            &adjusted_remainder_config,
+        )?;
+        remainder_build_time = remainder_start.elapsed();
+
+        let filter = remainder_build.filter;
+        remainder_total_slots = Some(remainder_build.total_slots);
+        remainder_actual_overhead = Some(remainder_build.actual_overhead);
+        remainder_abandoned_keys = remainder_build.abandoned_keys;
+        total_bytes += remainder_build.total_slots * mem::size_of::<RemFp>();
+
+        for &key in &remainder_candidates {
+            if !filter.contains(key) {
+                fallback_keys.push(key);
+            }
+        }
+
+        if !fallback_keys.is_empty() {
+            fallback_keys.sort_unstable();
+            fallback_keys.dedup();
+        }
+
+        Some(filter)
+    };
+
+    let fallback_key_count = fallback_keys.len();
+    total_bytes += fallback_key_count * mem::size_of::<u64>();
+
+    let bytes_per_key = if keys.is_empty() {
+        0.0
+    } else {
+        total_bytes as f64 / keys.len() as f64
+    };
+
+    let filter = CompleteFilter {
+        main: main_filter,
+        remainder: remainder_filter,
+        fallback_keys,
+    };
+
+    Ok(CompleteBuildOutput {
+        filter,
+        main_abandoned_keys,
+        remainder_abandoned_keys,
+        fallback_key_count,
+        main_total_slots,
+        main_actual_overhead,
+        remainder_total_slots,
+        remainder_actual_overhead,
+        main_build_time,
+        remainder_build_time,
+        total_bytes,
+        bytes_per_key,
+    })
+}
+
+#[allow(private_bounds)]
+impl<MainFp, RemFp> CompleteFilter<MainFp, RemFp>
+where
+    MainFp: FingerprintValue,
+    RemFp: FingerprintValue,
+{
+    /// Returns true when `key` is (probably) in the set.
+    /// Returns false when `key` is definitely not in the set.
+    pub fn contains(&self, key: u64) -> bool {
+        if let Some(remainder) = &self.remainder {
+            if remainder.contains(key) {
+                return true;
+            }
+        }
+        if self.main.contains(key) {
+            return true;
+        }
+        self.fallback_keys.binary_search(&key).is_ok()
+    }
+
+    /// Returns a reference to the main filter.
+    pub fn main_filter(&self) -> &BinaryFuseFilter<MainFp> {
+        &self.main
+    }
+
+    /// Returns a reference to the remainder filter if one was constructed.
+    pub fn remainder_filter(&self) -> Option<&BinaryFuseFilter<RemFp>> {
+        self.remainder.as_ref()
+    }
+
+    /// Returns the list of fallback keys stored exactly.
+    pub fn fallback_keys(&self) -> &[u64] {
+        &self.fallback_keys
     }
 }
 
@@ -387,11 +773,6 @@ fn fill_indexes<'a>(
 }
 
 #[inline]
-fn fingerprint(hash: u64) -> u8 {
-    hash as u8
-}
-
-#[inline]
 fn mixsplit(key: u64, seed: u64) -> u64 {
     splitmix64(key.wrapping_add(seed))
 }
@@ -480,5 +861,81 @@ mod tests {
                 assert!(filter.contains(k), "missing key: {}", k);
             }
         }
+    }
+
+    #[test]
+    fn fallback_contains_keys() {
+        let empty_main = BinaryFuseFilter::build(&[]).unwrap().filter;
+        let filter = CompleteFilter8_16 {
+            main: empty_main,
+            remainder: None,
+            fallback_keys: vec![2, 4, 6],
+        };
+        assert!(filter.contains(2));
+        assert!(filter.contains(4));
+        assert!(filter.contains(6));
+        assert!(!filter.contains(3));
+    }
+
+    #[test]
+    fn complete_filter_no_false_negatives() {
+        let keys: Vec<u64> = (0..5_000)
+            .map(|i| (i as u64).wrapping_mul(97_531))
+            .collect();
+        let build = BinaryFuseFilter::build_complete(&keys).expect("complete filter should build");
+        let filter = build.filter;
+        for &key in &keys {
+            assert!(filter.contains(key), "missing key: {}", key);
+        }
+        assert_eq!(filter.fallback_keys().len(), build.fallback_key_count);
+        assert!(
+            build.remainder_abandoned_keys.is_empty(),
+            "binary fuse remainder left abandoned keys"
+        );
+        assert!(
+            filter.fallback_keys().is_empty(),
+            "fallback should be empty when remainder succeeds"
+        );
+    }
+
+    #[test]
+    fn remainder_overhead_respects_minimum() {
+        let keys: Vec<u64> = (0..2_048).map(|i| splitmix64(i as u64)).collect();
+        let config = FilterConfig {
+            overhead: 1.0,
+            num_hashes: 8,
+            seed: 123,
+        };
+        let build = BinaryFuseFilter::<u16>::build_lossless_with_config(&keys, &config)
+            .expect("lossless remainder");
+        let min_slots = ((keys.len() as f64) * 1.1).ceil() as usize;
+        assert!(
+            build.total_slots >= min_slots,
+            "remainder total slots {} below minimum {}",
+            build.total_slots,
+            min_slots
+        );
+    }
+
+    #[test]
+    fn complete_filter_16_32_no_false_negatives() {
+        let keys: Vec<u64> = (0..8_192)
+            .map(|i| (i as u64).wrapping_mul(314_159))
+            .collect();
+        let build = BinaryFuseFilter::build_complete_16_32(&keys)
+            .expect("16/32 complete filter should build");
+        let filter = build.filter;
+        for &key in &keys {
+            assert!(filter.contains(key), "missing key: {}", key);
+        }
+        assert_eq!(filter.fallback_keys().len(), build.fallback_key_count);
+        assert!(
+            build.remainder_abandoned_keys.is_empty(),
+            "binary fuse remainder (32-bit) left abandoned keys"
+        );
+        assert!(
+            filter.fallback_keys().is_empty(),
+            "fallback should be empty when 32-bit remainder succeeds"
+        );
     }
 }
