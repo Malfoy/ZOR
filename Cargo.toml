@@ -1,11 +1,18 @@
 [package]
-name = "xor_filter"
+name = "zor_filter"
 version = "0.1.0"
 edition = "2021"
 
 [lib]
-name = "xor_filter"
+name = "zor_filter"
 path = "src/lib.rs"
+
+[[bin]]
+name = "random_benchmark"
+path = "src/bin/random_benchmark.rs"
+
+[dependencies]
+rayon = { version = "1.8", optional = false }
 
 [profile.release]
 opt-level = 3

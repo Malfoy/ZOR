@@ -1,35 +1,157 @@
 use std::env;
+use std::mem;
 use std::io::{self, Write};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use xor_filter::{BinaryFuseFilter, FilterConfig};
+mod fuse_filter;
+
+use fuse_filter::{FuseFilter, FuseFilterConfig};
+use zor_filter::{BinaryFuseFilter, FilterConfig};
+
+#[derive(Debug)]
+struct CascadeStats {
+    zor_slots: u64,
+    zor_empty_slots: u64,
+    zor_bytes: u64,
+    fuse_slots: u64,
+    abandoned: u64,
+}
+
+fn build_cascade(
+    keys: &[u64],
+    depth: usize,
+    level: usize,
+    filter_config: &FilterConfig,
+    aux_config: &FuseFilterConfig,
+    seed: u64,
+    run: u32,
+    worker: u32,
+    skip_if_present: bool,
+) -> CascadeStats {
+    let config = FilterConfig {
+        seed,
+        ..*filter_config
+    };
+
+    let is_root = level == 0;
+    let fp_size = if is_root {
+        mem::size_of::<u8>() as u64
+    } else {
+        mem::size_of::<u16>() as u64
+    };
+
+    let (total_slots, empty_slots, mut abandoned_keys, contains_fn) = if is_root {
+        let build = BinaryFuseFilter::<u8>::build_with_config(keys, &config)
+            .expect("configuration should be valid");
+        let filter = build.filter;
+        (
+            build.total_slots as u64,
+            build.empty_slots as u64,
+            build.abandoned_keys,
+            Box::new(move |k: u64| filter.contains(k)) as Box<dyn Fn(u64) -> bool + Send>,
+        )
+    } else {
+        let build = BinaryFuseFilter::<u16>::build_with_config(keys, &config)
+            .expect("configuration should be valid");
+        let filter = build.filter;
+        (
+            build.total_slots as u64,
+            build.empty_slots as u64,
+            build.abandoned_keys,
+            Box::new(move |k: u64| filter.contains(k)) as Box<dyn Fn(u64) -> bool + Send>,
+        )
+    };
+
+    let mut stats = CascadeStats {
+        zor_slots: total_slots,
+        zor_empty_slots: empty_slots,
+        zor_bytes: total_slots * fp_size,
+        fuse_slots: 0,
+        abandoned: 0,
+    };
+
+    if skip_if_present {
+        abandoned_keys.retain(|&k| !(contains_fn)(k));
+    }
+    stats.abandoned = abandoned_keys.len() as u64;
+
+    if !abandoned_keys.is_empty() {
+        if depth <= 1 {
+            let aux_build = FuseFilter::build(
+                &abandoned_keys,
+                &FuseFilterConfig {
+                    overhead: aux_config.overhead,
+                    seed: aux_config.seed,
+                },
+            )
+            .expect("aux filter should build");
+            stats.fuse_slots += aux_build.total_slots as u64;
+        } else {
+            let child_seed = derive_seed(
+                seed ^ 0xCADA_CADE_BABE_BEEF,
+                run as u64 + depth as u64,
+                worker as u64,
+            );
+            let child = build_cascade(
+                &abandoned_keys,
+                depth - 1,
+                level + 1,
+                filter_config,
+                aux_config,
+                child_seed,
+                run,
+                worker,
+                skip_if_present,
+            );
+            stats.zor_slots += child.zor_slots;
+            stats.zor_empty_slots += child.zor_empty_slots;
+            stats.zor_bytes += child.zor_bytes;
+            stats.fuse_slots += child.fuse_slots;
+        }
+    }
+
+    stats
+}
 
 fn main() {
     let cli = Cli::from_env();
+    for (idx, &num_hashes) in cli.hash_counts.iter().enumerate() {
+        if idx > 0 {
+            println!();
+        }
+        println!("=== num_hashes={num_hashes} ===");
+        run_benchmark(&cli, num_hashes);
+    }
+}
+
+fn run_benchmark(cli: &Cli, num_hashes: usize) {
     println!(
         "running {} iterations with key_count={}, overhead={}, num_hashes={}, threads={}",
-        cli.runs, cli.key_count, cli.overhead, cli.num_hashes, cli.threads
+        cli.runs, cli.key_count, cli.overhead, num_hashes, cli.threads
     );
 
     let config = FilterConfig {
         overhead: cli.overhead,
-        num_hashes: cli.num_hashes,
+        num_hashes,
         seed: cli.seed,
     };
 
     let runs = cli.runs;
     let key_count = cli.key_count;
+    let aux_fingerprint_size = mem::size_of::<u16>() as u64;
 
     let counter = Arc::new(AtomicU32::new(0));
     let completed = Arc::new(AtomicU64::new(0));
     let total_abandoned = Arc::new(AtomicU64::new(0));
-    let runs_with_abandoned = Arc::new(AtomicU64::new(0));
     let total_nanos = Arc::new(AtomicU64::new(0));
-    let total_actual_overhead = Arc::new(Mutex::new(0.0));
+    let total_empty_slots = Arc::new(AtomicU64::new(0));
+    let total_slots = Arc::new(AtomicU64::new(0));
+    let total_aux_slots = Arc::new(AtomicU64::new(0));
+    let total_zor_bytes = Arc::new(AtomicU64::new(0));
     let progress_done = Arc::new(AtomicBool::new(false));
 
     let mut handles = Vec::with_capacity(cli.threads);
@@ -38,9 +160,14 @@ fn main() {
         let completed_runs = Arc::clone(&completed);
         let total_abandoned = Arc::clone(&total_abandoned);
         let total_nanos = Arc::clone(&total_nanos);
-        let runs_with_abandoned = Arc::clone(&runs_with_abandoned);
-        let total_actual_overhead = Arc::clone(&total_actual_overhead);
+        let total_empty_slots = Arc::clone(&total_empty_slots);
+        let total_slots = Arc::clone(&total_slots);
+        let total_aux_slots = Arc::clone(&total_aux_slots);
+        let total_zor_bytes = Arc::clone(&total_zor_bytes);
         let config = config;
+        let aux_overhead = cli.aux_overhead;
+        let cascade_depth = cli.cascade_depth;
+        let skip_if_present = cli.skip_present_abandoned;
         let runs = runs;
         let key_count = key_count;
 
@@ -55,17 +182,29 @@ fn main() {
             let keys = random_keys(key_count, &mut generator);
 
             let start = Instant::now();
-            let build = BinaryFuseFilter::build_with_config(&keys, &config)
-                .expect("configuration should be valid");
-            let abandoned_count = build.abandoned_keys.len() as u64;
-            total_abandoned.fetch_add(abandoned_count, Ordering::Relaxed);
-            if abandoned_count > 0 {
-                runs_with_abandoned.fetch_add(1, Ordering::Relaxed);
-            }
-            {
-                let mut guard = total_actual_overhead.lock().unwrap();
-                *guard += build.actual_overhead;
-            }
+            let cascade_stats = build_cascade(
+                &keys,
+                cascade_depth,
+                0,
+                &config,
+                &FuseFilterConfig {
+                    overhead: aux_overhead,
+                    seed: derive_seed(
+                        config.seed ^ 0xDEAD_BEEF_A55A_55AA,
+                        run as u64,
+                        worker_id as u64,
+                    ),
+                },
+                run_seed,
+                run,
+                worker_id as u32,
+                skip_if_present,
+            );
+            total_abandoned.fetch_add(cascade_stats.abandoned, Ordering::Relaxed);
+            total_empty_slots.fetch_add(cascade_stats.zor_empty_slots, Ordering::Relaxed);
+            total_slots.fetch_add(cascade_stats.zor_slots, Ordering::Relaxed);
+            total_aux_slots.fetch_add(cascade_stats.fuse_slots, Ordering::Relaxed);
+            total_zor_bytes.fetch_add(cascade_stats.zor_bytes, Ordering::Relaxed);
             let elapsed = start.elapsed().as_nanos() as u64;
             total_nanos.fetch_add(elapsed, Ordering::Relaxed);
             completed_runs.fetch_add(1, Ordering::Relaxed);
@@ -77,9 +216,11 @@ fn main() {
     let progress_handle = {
         let completed = Arc::clone(&completed);
         let total_abandoned = Arc::clone(&total_abandoned);
-        let runs_with_abandoned = Arc::clone(&runs_with_abandoned);
         let progress_done = Arc::clone(&progress_done);
-        let total_actual_overhead = Arc::clone(&total_actual_overhead);
+        let total_empty_slots = Arc::clone(&total_empty_slots);
+        let total_slots = Arc::clone(&total_slots);
+        let total_aux_slots = Arc::clone(&total_aux_slots);
+        let total_zor_bytes = Arc::clone(&total_zor_bytes);
         thread::spawn(move || {
             let runs_total = runs as u64;
             loop {
@@ -89,28 +230,43 @@ fn main() {
                 thread::sleep(Duration::from_secs(1));
                 let completed_runs = completed.load(Ordering::Relaxed);
                 let abandoned = total_abandoned.load(Ordering::Relaxed);
-                let runs_with_abandoned = runs_with_abandoned.load(Ordering::Relaxed);
                 let processed_keys = completed_runs * key_count as u64;
-                let mean_per_run = if completed_runs == 0 {
+                let abandoned_pct = if processed_keys == 0 {
                     0.0
                 } else {
-                    abandoned as f64 / completed_runs as f64
+                    (abandoned as f64 / processed_keys as f64) * 100.0
                 };
-                let avg_overhead = {
-                    let guard = total_actual_overhead.lock().unwrap();
-                    if completed_runs == 0 {
+                let avg_empty_pct = {
+                    let slots = total_slots.load(Ordering::Relaxed);
+                    let empty = total_empty_slots.load(Ordering::Relaxed);
+                    if slots == 0 {
                         0.0
                     } else {
-                        *guard / completed_runs as f64
+                        (empty as f64 / slots as f64) * 100.0
                     }
                 };
+            let total_aux_slots_accum = total_aux_slots.load(Ordering::Relaxed);
+            let total_zor_bytes_accum = total_zor_bytes.load(Ordering::Relaxed);
+            let avg_bytes_per_key = if completed_runs == 0 || key_count == 0 {
+                    0.0
+                } else {
+                    (total_zor_bytes_accum as f64
+                        + total_aux_slots_accum as f64 * aux_fingerprint_size as f64)
+                        / (completed_runs as f64 * key_count as f64)
+                };
+                let aux_bytes_per_key = if completed_runs == 0 || key_count == 0 {
+                    0.0
+                } else {
+                    (total_aux_slots_accum as f64 * aux_fingerprint_size as f64)
+                        / (completed_runs as f64 * key_count as f64)
+                };
                 print!(
-                    "\rprogress: {completed}/{runs} runs (abandoned total: {abandoned}, mean/run: {mean:.3}, runs with abandon: {with_abandon}, processed keys: {processed}, avg overhead: {overhead:.4})",
+                    "\rprogress: {completed}/{runs} runs (abandoned: {abandoned_pct:.4}%, avg bytes/key: {bytes_per_key:.4} (aux: {aux_bytes_per_key:.4}), mean empty slots: {empty_pct:.4}%)",
                     completed = completed_runs,
-                    mean = mean_per_run,
-                    with_abandon = runs_with_abandoned,
-                    processed = processed_keys,
-                    overhead = avg_overhead
+                    abandoned_pct = abandoned_pct,
+                    bytes_per_key = avg_bytes_per_key,
+                    aux_bytes_per_key = aux_bytes_per_key,
+                    empty_pct = avg_empty_pct
                 );
                 let _ = io::stdout().flush();
                 if completed_runs >= runs_total {
@@ -119,28 +275,43 @@ fn main() {
             }
             let completed_runs = completed.load(Ordering::Relaxed);
             let abandoned = total_abandoned.load(Ordering::Relaxed);
-            let runs_with_abandoned = runs_with_abandoned.load(Ordering::Relaxed);
             let processed_keys = completed_runs * key_count as u64;
-            let mean_per_run = if completed_runs == 0 {
+            let abandoned_pct = if processed_keys == 0 {
                 0.0
             } else {
-                abandoned as f64 / completed_runs as f64
+                (abandoned as f64 / processed_keys as f64) * 100.0
             };
-            let avg_overhead = {
-                let guard = total_actual_overhead.lock().unwrap();
-                if completed_runs == 0 {
+            let avg_empty_pct = {
+                let slots = total_slots.load(Ordering::Relaxed);
+                let empty = total_empty_slots.load(Ordering::Relaxed);
+                if slots == 0 {
                     0.0
                 } else {
-                    *guard / completed_runs as f64
+                    (empty as f64 / slots as f64) * 100.0
                 }
             };
+            let total_aux_slots_accum = total_aux_slots.load(Ordering::Relaxed);
+            let total_zor_bytes_accum = total_zor_bytes.load(Ordering::Relaxed);
+            let avg_bytes_per_key = if completed_runs == 0 || key_count == 0 {
+                0.0
+            } else {
+                (total_zor_bytes_accum as f64
+                    + total_aux_slots_accum as f64 * aux_fingerprint_size as f64)
+                    / (completed_runs as f64 * key_count as f64)
+            };
+            let aux_bytes_per_key = if completed_runs == 0 || key_count == 0 {
+                0.0
+            } else {
+                (total_aux_slots_accum as f64 * aux_fingerprint_size as f64)
+                    / (completed_runs as f64 * key_count as f64)
+            };
             println!(
-                "\rprogress: {completed}/{runs} runs (abandoned total: {abandoned}, mean/run: {mean:.3}, runs with abandon: {with_abandon}, processed keys: {processed}, avg overhead: {overhead:.4})",
+                "\rprogress: {completed}/{runs} runs (abandoned: {abandoned_pct:.4}%, avg bytes/key: {bytes_per_key:.4} (aux: {aux_bytes_per_key:.4}), mean empty slots: {empty_pct:.4}%)",
                 completed = completed_runs,
-                mean = mean_per_run,
-                with_abandon = runs_with_abandoned,
-                processed = processed_keys,
-                overhead = avg_overhead
+                abandoned_pct = abandoned_pct,
+                bytes_per_key = avg_bytes_per_key,
+                aux_bytes_per_key = aux_bytes_per_key,
+                empty_pct = avg_empty_pct
             );
         })
     };
@@ -158,11 +329,10 @@ fn main() {
 
     let completed = completed.load(Ordering::Relaxed);
     let abandoned_total = total_abandoned.load(Ordering::Relaxed);
-    let runs_with_abandoned = runs_with_abandoned.load(Ordering::Relaxed);
-    let aggregated_overhead = {
-        let guard = total_actual_overhead.lock().unwrap();
-        *guard
-    };
+    let total_empty_slots = total_empty_slots.load(Ordering::Relaxed);
+    let total_slots = total_slots.load(Ordering::Relaxed);
+    let total_aux_slots = total_aux_slots.load(Ordering::Relaxed);
+    let total_zor_bytes = total_zor_bytes.load(Ordering::Relaxed);
 
     if completed > 0 {
         let total_nanos = total_nanos.load(Ordering::Relaxed);
@@ -173,13 +343,30 @@ fn main() {
         } else {
             abandoned_total as f64 / total_keys as f64
         };
-        let mean_per_run = abandoned_total as f64 / completed as f64;
-        let avg_overhead = aggregated_overhead / completed as f64;
+        let avg_bytes_per_key = if total_keys == 0 {
+            0.0
+        } else {
+            (total_zor_bytes as f64
+                + total_aux_slots as f64 * aux_fingerprint_size as f64)
+                / total_keys as f64
+        };
+        let aux_bytes_per_key = if total_keys == 0 {
+            0.0
+        } else {
+            (total_aux_slots as f64 * aux_fingerprint_size as f64) / total_keys as f64
+        };
+        let mean_empty_pct = if total_slots == 0 {
+            0.0
+        } else {
+            (total_empty_slots as f64 / total_slots as f64) * 100.0
+        };
         println!(
-            "runs: {completed} | abandoned keys: {abandoned_total} total, {mean_per_run:.3} per run ({:.4}% of {} keys) | runs with abandoned keys: {runs_with_abandoned} | avg actual overhead: {avg_overhead:.4} | mean build time: {:?}",
-            abandoned_rate * 100.0,
-            total_keys,
-            mean
+            "runs: {completed} | abandoned keys: {abandoned_pct:.4}% | avg bytes/key: {avg_bytes_per_key:.4} (aux: {aux_bytes_per_key:.4}) | mean empty slots: {mean_empty_pct:.4}% | mean build time: {mean_build_time:?}",
+            abandoned_pct = abandoned_rate * 100.0,
+            avg_bytes_per_key = avg_bytes_per_key,
+            aux_bytes_per_key = aux_bytes_per_key,
+            mean_empty_pct = mean_empty_pct,
+            mean_build_time = mean
         );
     } else {
         println!("no runs completed, mean build time unavailable");
@@ -190,7 +377,10 @@ fn main() {
 struct Cli {
     key_count: usize,
     overhead: f64,
-    num_hashes: usize,
+    aux_overhead: f64,
+    cascade_depth: usize,
+    skip_present_abandoned: bool,
+    hash_counts: Vec<usize>,
     runs: u32,
     seed: u64,
     threads: usize,
@@ -199,14 +389,17 @@ struct Cli {
 impl Cli {
     fn from_env() -> Self {
         let mut cli = Self {
-            key_count: 100_000,
-            overhead: 1.0,
-            num_hashes: 8,
-            runs: 1000,
+            key_count: 10_000_000,
+            overhead: 1.00,
+            aux_overhead: 1.1,
+            cascade_depth: 1,
+            skip_present_abandoned: false,
+            hash_counts: vec![2,3,4,5,6,7,8],
+            runs: 100,
             seed: generate_seed(),
             threads: thread::available_parallelism()
                 .map(|n| n.get())
-                .unwrap_or(1),
+                .unwrap_or(32),
         };
 
         let mut args = env::args().skip(1);
@@ -224,7 +417,10 @@ impl Cli {
             match flag.as_str() {
                 "--keys" => cli.key_count = parse(args.next(), "--keys"),
                 "--overhead" => cli.overhead = parse(args.next(), "--overhead"),
-                "--hashes" => cli.num_hashes = parse(args.next(), "--hashes"),
+                "--aux-overhead" => cli.aux_overhead = parse(args.next(), "--aux-overhead"),
+                "--cascade-depth" => cli.cascade_depth = parse(args.next(), "--cascade-depth"),
+                "--skip-present-abandoned" => cli.skip_present_abandoned = true,
+                "--hashes" => cli.hash_counts = parse_hashes(args.next(), "--hashes"),
                 "--runs" => cli.runs = parse(args.next(), "--runs"),
                 "--seed" => cli.seed = parse(args.next(), "--seed"),
                 "--threads" => cli.threads = parse(args.next(), "--threads"),
@@ -234,6 +430,25 @@ impl Cli {
 
         cli
     }
+}
+
+fn parse_hashes(value: Option<String>, name: &str) -> Vec<usize> {
+    let value = value.unwrap_or_else(|| panic!("expected value after {name}"));
+    let hashes: Vec<usize> = value
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            part.parse::<usize>()
+                .unwrap_or_else(|err| panic!("invalid value for {name}: {err}"))
+        })
+        .collect();
+
+    if hashes.is_empty() {
+        panic!("expected at least one value after {name}");
+    }
+
+    hashes
 }
 
 fn random_keys(count: usize, generator: &mut SplitMix64) -> Vec<u64> {
