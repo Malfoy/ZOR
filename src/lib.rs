@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 const MAX_HASHES: usize = 32;
 const MAX_SEGMENT_LENGTH_LOG: u32 = 11;
 const MAX_BINARY_FUSE_ATTEMPTS: usize = 32;
-const MAX_TIE_SCAN: usize = 1;
+const MAX_TIE_SCAN: usize = 8;
 
 #[derive(Clone, Copy, Debug)]
 struct Layout {
@@ -26,6 +26,243 @@ struct Layout {
     segment_length_mask: usize,
     segment_count: usize,
     array_length: usize,
+}
+
+/// A 4-bit fingerprint representation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Fingerprint4(u8);
+
+impl Fingerprint4 {
+    #[inline]
+    fn mask(self) -> u8 {
+        self.0 & 0x0F
+    }
+}
+
+/// A 1-bit fingerprint representation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Fingerprint1(u8);
+
+impl Fingerprint1 {
+    #[inline]
+    fn mask(self) -> u8 {
+        self.0 & 0x01
+    }
+}
+
+/// A 2-bit fingerprint representation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Fingerprint2(u8);
+
+impl Fingerprint2 {
+    #[inline]
+    fn mask(self) -> u8 {
+        self.0 & 0x03
+    }
+}
+
+/// Storage backend for fingerprints.
+pub trait FingerprintStorage: Send + Sync {
+    type Fingerprint: FingerprintValue;
+
+    fn new(len: usize) -> Self;
+    fn len(&self) -> usize;
+    fn is_empty(&self) -> bool;
+    fn get(&self, index: usize) -> Self::Fingerprint;
+    fn set(&mut self, index: usize, value: Self::Fingerprint);
+    fn byte_size(&self) -> usize;
+}
+
+pub struct PlainFingerprintStorage<F: FingerprintValue> {
+    data: Vec<F>,
+}
+
+impl<F: FingerprintValue> FingerprintStorage for PlainFingerprintStorage<F> {
+    type Fingerprint = F;
+
+    #[inline]
+    fn new(len: usize) -> Self {
+        Self {
+            data: vec![F::default(); len],
+        }
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+
+    #[inline]
+    fn get(&self, index: usize) -> Self::Fingerprint {
+        self.data[index]
+    }
+
+    #[inline]
+    fn set(&mut self, index: usize, value: Self::Fingerprint) {
+        self.data[index] = value;
+    }
+
+    #[inline]
+    fn byte_size(&self) -> usize {
+        self.data.len() * std::mem::size_of::<F>()
+    }
+}
+
+pub struct PackedFingerprintStorage4 {
+    data: Vec<u8>,
+    len: usize,
+}
+
+pub struct PackedFingerprintStorage1 {
+    data: Vec<u8>,
+    len: usize,
+}
+
+pub struct PackedFingerprintStorage2 {
+    data: Vec<u8>,
+    len: usize,
+}
+
+impl FingerprintStorage for PackedFingerprintStorage4 {
+    type Fingerprint = Fingerprint4;
+
+    #[inline]
+    fn new(len: usize) -> Self {
+        let bytes = (len + 1) / 2;
+        Self {
+            data: vec![0u8; bytes],
+            len,
+        }
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    #[inline]
+    fn get(&self, index: usize) -> Self::Fingerprint {
+        let byte = self.data[index / 2];
+        if index % 2 == 0 {
+            Fingerprint4(byte & 0x0F)
+        } else {
+            Fingerprint4(byte >> 4)
+        }
+    }
+
+    #[inline]
+    fn set(&mut self, index: usize, value: Self::Fingerprint) {
+        let masked = value.mask();
+        let byte = &mut self.data[index / 2];
+        if index % 2 == 0 {
+            *byte = (*byte & 0xF0) | masked;
+        } else {
+            *byte = (*byte & 0x0F) | (masked << 4);
+        }
+    }
+
+    #[inline]
+    fn byte_size(&self) -> usize {
+        self.data.len()
+    }
+}
+
+impl FingerprintStorage for PackedFingerprintStorage1 {
+    type Fingerprint = Fingerprint1;
+
+    #[inline]
+    fn new(len: usize) -> Self {
+        let bytes = (len + 7) / 8;
+        Self {
+            data: vec![0u8; bytes],
+            len,
+        }
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    #[inline]
+    fn get(&self, index: usize) -> Self::Fingerprint {
+        let byte = self.data[index / 8];
+        let shift = index % 8;
+        Fingerprint1((byte >> shift) & 0x01)
+    }
+
+    #[inline]
+    fn set(&mut self, index: usize, value: Self::Fingerprint) {
+        let masked = value.mask();
+        let byte = &mut self.data[index / 8];
+        let shift = index % 8;
+        *byte &= !(0x01 << shift);
+        *byte |= masked << shift;
+    }
+
+    #[inline]
+    fn byte_size(&self) -> usize {
+        self.data.len()
+    }
+}
+
+impl FingerprintStorage for PackedFingerprintStorage2 {
+    type Fingerprint = Fingerprint2;
+
+    #[inline]
+    fn new(len: usize) -> Self {
+        let bytes = (len + 3) / 4;
+        Self {
+            data: vec![0u8; bytes],
+            len,
+        }
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    #[inline]
+    fn get(&self, index: usize) -> Self::Fingerprint {
+        let byte = self.data[index / 4];
+        let shift = (index % 4) * 2;
+        Fingerprint2((byte >> shift) & 0x03)
+    }
+
+    #[inline]
+    fn set(&mut self, index: usize, value: Self::Fingerprint) {
+        let masked = value.mask();
+        let byte = &mut self.data[index / 4];
+        let shift = (index % 4) * 2;
+        *byte &= !(0x03 << shift);
+        *byte |= masked << shift;
+    }
+
+    #[inline]
+    fn byte_size(&self) -> usize {
+        self.data.len()
+    }
 }
 
 /// Error returned when construction of the filter fails.
@@ -80,18 +317,40 @@ impl Default for CompleteFilterConfig {
 }
 
 /// Output of building a [`BinaryFuseFilter`].
-pub struct BuildOutput<Fingerprint = u8> {
+pub struct BuildOutput<Fingerprint = u8>
+where
+    Fingerprint: FingerprintValue,
+{
     pub filter: BinaryFuseFilter<Fingerprint>,
     pub abandoned_keys: Vec<u64>,
     pub total_slots: usize,
     /// Number of slots that were not targeted by any key during construction.
     pub empty_slots: usize,
     pub actual_overhead: f64,
+    /// Keys that were satisfied “for free” via identical fingerprints in the same cell.
+    pub free_inserted_keys: usize,
 }
+
+/// Build output specialized for 8-bit fingerprints.
+pub type BuildOutput8 = BuildOutput<u8>;
+/// Build output specialized for 16-bit fingerprints.
+pub type BuildOutput16 = BuildOutput<u16>;
+/// Build output specialized for 32-bit fingerprints.
+pub type BuildOutput32 = BuildOutput<u32>;
+/// Build output specialized for 1-bit fingerprints.
+pub type BuildOutput1 = BuildOutput<Fingerprint1>;
+/// Build output specialized for 2-bit fingerprints.
+pub type BuildOutput2 = BuildOutput<Fingerprint2>;
+/// Build output specialized for 4-bit fingerprints.
+pub type BuildOutput4 = BuildOutput<Fingerprint4>;
 
 /// Output of building a complete two-stage filter with [`BinaryFuseFilter::build_complete_8_16`]
 /// or [`BinaryFuseFilter::build_complete_16_32`].
-pub struct CompleteBuildOutput<MainFp = u8, RemFp = u16> {
+pub struct CompleteBuildOutput<MainFp = u8, RemFp = u16>
+where
+    MainFp: FingerprintValue,
+    RemFp: FingerprintValue,
+{
     pub filter: CompleteFilter<MainFp, RemFp>,
     pub main_abandoned_keys: Vec<u64>,
     pub remainder_abandoned_keys: Vec<u64>,
@@ -162,7 +421,11 @@ pub struct PartitionStats {
 }
 
 /// Output of building partitioned filters.
-pub struct PartitionedBuildOutput<MainFp = u8, RemFp = u16> {
+pub struct PartitionedBuildOutput<MainFp = u8, RemFp = u16>
+where
+    MainFp: FingerprintValue,
+    RemFp: FingerprintValue,
+{
     pub filter: PartitionedCompleteFilter<MainFp, RemFp>,
     pub partition_stats: Vec<PartitionStats>,
     pub total_bytes: usize,
@@ -175,16 +438,36 @@ pub type PartitionedBuildOutput8_16 = PartitionedBuildOutput<u8, u16>;
 pub type PartitionedBuildOutput16_32 = PartitionedBuildOutput<u16, u32>;
 
 /// A static Binary Fuse filter for 64-bit keys parameterized over fingerprint width.
-pub struct BinaryFuseFilter<Fingerprint = u8> {
+pub struct BinaryFuseFilter<Fingerprint = u8>
+where
+    Fingerprint: FingerprintValue,
+{
     seed: u64,
     num_hashes: usize,
     layout: Layout,
-    fingerprints: Vec<Fingerprint>,
+    fingerprints: <Fingerprint as FingerprintValue>::Storage,
 }
+
+/// Binary Fuse filter using 4-bit fingerprints.
+pub type BinaryFuseFilter4 = BinaryFuseFilter<Fingerprint4>;
+/// Binary Fuse filter using 2-bit fingerprints.
+pub type BinaryFuseFilter2 = BinaryFuseFilter<Fingerprint2>;
+/// Binary Fuse filter using 1-bit fingerprints.
+pub type BinaryFuseFilter1 = BinaryFuseFilter<Fingerprint1>;
+/// Binary Fuse filter using 8-bit fingerprints.
+pub type BinaryFuseFilter8 = BinaryFuseFilter<u8>;
+/// Binary Fuse filter using 16-bit fingerprints.
+pub type BinaryFuseFilter16 = BinaryFuseFilter<u16>;
+/// Binary Fuse filter using 32-bit fingerprints.
+pub type BinaryFuseFilter32 = BinaryFuseFilter<u32>;
 
 /// A composed filter made of a main Binary Fuse filter and an optional remainder filter augmented
 /// with exact fallback storage.
-pub struct CompleteFilter<MainFp = u8, RemFp = u16> {
+pub struct CompleteFilter<MainFp = u8, RemFp = u16>
+where
+    MainFp: FingerprintValue,
+    RemFp: FingerprintValue,
+{
     main: BinaryFuseFilter<MainFp>,
     remainder: Option<BinaryFuseFilter<RemFp>>,
     fallback_keys: Vec<u64>,
@@ -194,18 +477,35 @@ pub type CompleteFilter8_16 = CompleteFilter<u8, u16>;
 pub type CompleteFilter16_32 = CompleteFilter<u16, u32>;
 
 /// A collection of partitioned complete filters.
-pub struct PartitionedCompleteFilter<MainFp = u8, RemFp = u16> {
+pub struct PartitionedCompleteFilter<MainFp = u8, RemFp = u16>
+where
+    MainFp: FingerprintValue,
+    RemFp: FingerprintValue,
+{
     partition_seed: u64,
     filters: Vec<CompleteFilter<MainFp, RemFp>>,
 }
 
 pub trait FingerprintValue:
-    Copy + Default + PartialEq + BitXor<Output = Self> + BitXorAssign + fmt::Debug + 'static
+    Copy
+    + Default
+    + PartialEq
+    + BitXor<Output = Self>
+    + BitXorAssign
+    + fmt::Debug
+    + Send
+    + Sync
+    + Eq
+    + std::hash::Hash
+    + 'static
 {
+    type Storage: FingerprintStorage<Fingerprint = Self>;
     fn from_hash(hash: u64) -> Self;
 }
 
 impl FingerprintValue for u8 {
+    type Storage = PlainFingerprintStorage<u8>;
+
     #[inline]
     fn from_hash(hash: u64) -> Self {
         hash as u8
@@ -213,6 +513,8 @@ impl FingerprintValue for u8 {
 }
 
 impl FingerprintValue for u16 {
+    type Storage = PlainFingerprintStorage<u16>;
+
     #[inline]
     fn from_hash(hash: u64) -> Self {
         hash as u16
@@ -220,9 +522,104 @@ impl FingerprintValue for u16 {
 }
 
 impl FingerprintValue for u32 {
+    type Storage = PlainFingerprintStorage<u32>;
+
     #[inline]
     fn from_hash(hash: u64) -> Self {
         hash as u32
+    }
+}
+
+impl Default for Fingerprint1 {
+    fn default() -> Self {
+        Fingerprint1(0)
+    }
+}
+
+impl BitXor for Fingerprint1 {
+    type Output = Self;
+
+    #[inline]
+    fn bitxor(self, rhs: Self) -> Self::Output {
+        Fingerprint1((self.mask() ^ rhs.mask()) & 0x01)
+    }
+}
+
+impl BitXorAssign for Fingerprint1 {
+    #[inline]
+    fn bitxor_assign(&mut self, rhs: Self) {
+        *self = *self ^ rhs;
+    }
+}
+
+impl FingerprintValue for Fingerprint1 {
+    type Storage = PackedFingerprintStorage1;
+
+    #[inline]
+    fn from_hash(hash: u64) -> Self {
+        Fingerprint1((hash as u8) & 0x01)
+    }
+}
+
+impl Default for Fingerprint4 {
+    fn default() -> Self {
+        Fingerprint4(0)
+    }
+}
+
+impl BitXor for Fingerprint4 {
+    type Output = Self;
+
+    #[inline]
+    fn bitxor(self, rhs: Self) -> Self::Output {
+        Fingerprint4((self.mask() ^ rhs.mask()) & 0x0F)
+    }
+}
+
+impl BitXorAssign for Fingerprint4 {
+    #[inline]
+    fn bitxor_assign(&mut self, rhs: Self) {
+        *self = *self ^ rhs;
+    }
+}
+
+impl FingerprintValue for Fingerprint4 {
+    type Storage = PackedFingerprintStorage4;
+
+    #[inline]
+    fn from_hash(hash: u64) -> Self {
+        Fingerprint4((hash as u8) & 0x0F)
+    }
+}
+
+impl Default for Fingerprint2 {
+    fn default() -> Self {
+        Fingerprint2(0)
+    }
+}
+
+impl BitXor for Fingerprint2 {
+    type Output = Self;
+
+    #[inline]
+    fn bitxor(self, rhs: Self) -> Self::Output {
+        Fingerprint2((self.mask() ^ rhs.mask()) & 0x03)
+    }
+}
+
+impl BitXorAssign for Fingerprint2 {
+    #[inline]
+    fn bitxor_assign(&mut self, rhs: Self) {
+        *self = *self ^ rhs;
+    }
+}
+
+impl FingerprintValue for Fingerprint2 {
+    type Storage = PackedFingerprintStorage2;
+
+    #[inline]
+    fn from_hash(hash: u64) -> Self {
+        Fingerprint2((hash as u8) & 0x03)
     }
 }
 
@@ -243,12 +640,13 @@ where
                     seed: 0,
                     num_hashes: config.num_hashes,
                     layout,
-                    fingerprints: vec![F::default(); array_len],
+                    fingerprints: F::Storage::new(array_len),
                 },
                 abandoned_keys: Vec::new(),
                 total_slots: array_len,
                 empty_slots: array_len,
                 actual_overhead: 0.0,
+                free_inserted_keys: 0,
             });
         }
 
@@ -273,10 +671,15 @@ where
 
         let mut fp = F::from_hash(hash);
         for &i in indexes {
-            fp ^= self.fingerprints[i];
+            fp ^= self.fingerprints.get(i);
         }
 
         fp == F::default()
+    }
+
+    /// Returns the number of bytes used to store the fingerprints.
+    pub fn fingerprint_bytes(&self) -> usize {
+        self.fingerprints.byte_size()
     }
 
     fn build_with_seed(
@@ -290,6 +693,7 @@ where
         let mut idx_buf = [0usize; MAX_HASHES];
         let mut hashes = Vec::with_capacity(keys.len());
         let mut active = vec![true; keys.len()];
+        let mut free_inserted = 0usize;
 
         for &key in keys {
             let hash = mixsplit(key, seed);
@@ -327,6 +731,7 @@ where
         let mut queue = Vec::with_capacity(array_len);
         let mut multi_heap: BinaryHeap<(Reverse<u32>, usize)> = BinaryHeap::with_capacity(array_len);
         let mut abandoned_keys = Vec::new();
+        let mut tmp_idx_buf = [0usize; MAX_HASHES];
 
         for i in 0..array_len {
             match degrees[i] {
@@ -339,29 +744,105 @@ where
         let key_weight =
             |degrees: &[u32], key_idx: usize, idx_buf: &mut [usize; MAX_HASHES]| -> u64 {
                 let indexes = fill_indexes(hashes[key_idx], num_hashes, layout, idx_buf);
-                indexes.iter().map(|&index| degrees[index] as u64).sum()
-            };
+            indexes.iter().map(|&index| degrees[index] as u64).sum()
+        };
 
-        let cell_total_weight =
-            |degrees: &[u32],
-             active: &[bool],
-             cell: usize,
-             idx_buf: &mut [usize; MAX_HASHES]|
-             -> Option<u64> {
+        let cell_group_stats =
+            |active: &[bool], cell: usize| -> (usize, usize) {
                 let start = adjacency_offsets[cell];
                 let end = adjacency_offsets[cell + 1];
-                let mut total: u64 = 0;
-                let mut found = false;
+                let mut counts: Vec<(F, usize)> = Vec::new();
+                let mut total_active = 0usize;
                 for pos in start..end {
                     let key_idx = adjacency[pos] as usize;
                     if !active[key_idx] {
                         continue;
                     }
-                    found = true;
-                    total = total.saturating_add(key_weight(degrees, key_idx, idx_buf));
+                    total_active += 1;
+                    let fp = F::from_hash(hashes[key_idx]);
+                    if let Some((_, c)) = counts.iter_mut().find(|(f, _)| *f == fp) {
+                        *c += 1;
+                    } else {
+                        counts.push((fp, 1));
+                    }
                 }
-                if found { Some(total) } else { None }
+                let best = counts.into_iter().map(|(_, c)| c).max().unwrap_or(0);
+                (best, total_active)
             };
+
+        let drop_equivalent_keys = |key_idx: usize,
+                                    cell: usize,
+                                    degrees: &mut [u32],
+                                    active: &mut [bool],
+                                    abandoned: &mut Vec<u64>,
+                                    queue: &mut Vec<usize>,
+                                    multi_heap: &mut BinaryHeap<(Reverse<u32>, usize)>,
+                                    idx_buf: &mut [usize; MAX_HASHES],
+                                    tmp_buf: &mut [usize; MAX_HASHES]| {
+            let chosen_indexes =
+                fill_indexes(hashes[key_idx], num_hashes, layout, idx_buf).to_vec();
+            let start = adjacency_offsets[cell];
+            let end = adjacency_offsets[cell + 1];
+            for pos in start..end {
+                let other_key = adjacency[pos] as usize;
+                if other_key == key_idx || !active[other_key] {
+                    continue;
+                }
+                let other_indexes = fill_indexes(hashes[other_key], num_hashes, layout, tmp_buf);
+                if other_indexes == chosen_indexes.as_slice() {
+                    active[other_key] = false;
+                    abandoned.push(keys[other_key]);
+                    for &index in other_indexes {
+                        if degrees[index] == 0 {
+                            continue;
+                        }
+                        degrees[index] -= 1;
+                        if degrees[index] == 1 {
+                            queue.push(index);
+                        } else if degrees[index] > 1 {
+                            multi_heap.push((Reverse(degrees[index]), index));
+                        }
+                    }
+                }
+            }
+        };
+
+        let drop_same_fingerprint = |cell: usize,
+                                     fp: F,
+                                     skip_key: usize,
+                                     degrees: &mut [u32],
+                                     active: &mut [bool],
+                                     _abandoned: &mut Vec<u64>,
+                                     free_count: &mut usize,
+                                     queue: &mut Vec<usize>,
+                                     multi_heap: &mut BinaryHeap<(Reverse<u32>, usize)>,
+                                     tmp_buf: &mut [usize; MAX_HASHES]| {
+            let start = adjacency_offsets[cell];
+            let end = adjacency_offsets[cell + 1];
+            for pos in start..end {
+                let other_key = adjacency[pos] as usize;
+                if other_key == skip_key || !active[other_key] {
+                    continue;
+                }
+                if F::from_hash(hashes[other_key]) != fp {
+                    continue;
+                }
+                active[other_key] = false;
+                *free_count += 1;
+                let indexes = fill_indexes(hashes[other_key], num_hashes, layout, tmp_buf);
+                for &index in indexes {
+                    if degrees[index] == 0 {
+                        continue;
+                    }
+                    degrees[index] -= 1;
+                    if degrees[index] == 1 {
+                        queue.push(index);
+                    } else if degrees[index] > 1 {
+                        multi_heap.push((Reverse(degrees[index]), index));
+                    }
+                }
+            }
+        };
 
         while stack.len() + abandoned_keys.len() < keys.len() {
             let mut progress = false;
@@ -374,18 +855,56 @@ where
                 let start = adjacency_offsets[cell];
                 let end = adjacency_offsets[cell + 1];
                 let mut found_key = None;
+                let mut chosen_fp = None;
+                let mut fp_counts: Vec<(F, usize, usize)> = Vec::new();
                 for pos in start..end {
                     let key_idx = adjacency[pos] as usize;
-                    if active[key_idx] {
-                        found_key = Some(key_idx);
-                        break;
+                    if !active[key_idx] {
+                        continue;
                     }
+                    let fp = F::from_hash(hashes[key_idx]);
+                    if let Some((_, count, _)) = fp_counts.iter_mut().find(|(f, _, _)| *f == fp) {
+                        *count += 1;
+                    } else {
+                        fp_counts.push((fp, 1, key_idx));
+                    }
+                }
+
+                if let Some((fp, _, key_idx)) =
+                    fp_counts.into_iter().max_by_key(|(_, count, _)| *count)
+                {
+                    found_key = Some(key_idx);
+                    chosen_fp = Some(fp);
                 }
 
                 if let Some(key_idx) = found_key {
                     progress = true;
+                    let key_fp = chosen_fp.unwrap_or_else(|| F::from_hash(hashes[key_idx]));
                     active[key_idx] = false;
                     stack.push((cell, key_idx));
+                    drop_equivalent_keys(
+                        key_idx,
+                        cell,
+                        &mut degrees,
+                        &mut active,
+                        &mut abandoned_keys,
+                        &mut queue,
+                        &mut multi_heap,
+                        &mut idx_buf,
+                        &mut tmp_idx_buf,
+                    );
+                    drop_same_fingerprint(
+                        cell,
+                        key_fp,
+                        key_idx,
+                        &mut degrees,
+                        &mut active,
+                        &mut abandoned_keys,
+                        &mut free_inserted,
+                        &mut queue,
+                        &mut multi_heap,
+                        &mut tmp_idx_buf,
+                    );
 
                     let indexes = fill_indexes(hashes[key_idx], num_hashes, layout, &mut idx_buf);
                     for &index in indexes {
@@ -412,7 +931,9 @@ where
                 continue;
             }
 
-            // No degree-1 cells available, abandon a key from a multi-degree cell.
+            // No degree-1 cells available, abandon a key from a multi-degree cell. Prefer the cell
+            // that would abandon the fewest keys (grouping identical fingerprints), scanning a
+            // limited number of ties to avoid excessive work.
             let candidate = loop {
                 let Some((Reverse(recorded_deg), cell)) = multi_heap.pop() else {
                     break None;
@@ -422,17 +943,15 @@ where
                     continue;
                 }
 
-                // Gather other cells with the same degree to pick the one whose keys have the
-                // lightest total neighbourhood weight. Bound the scan to keep hot loops fast.
-                let Some(mut best_weight) =
-                    cell_total_weight(&degrees, &active, cell, &mut idx_buf)
-                else {
+                let (mut best_cov, total_active) = cell_group_stats(&active, cell);
+                if best_cov == 0 {
                     degrees[cell] = 0;
                     continue;
-                };
+                }
                 let mut best_cell = cell;
-                let mut tied_cells = Vec::new();
+                let mut best_abandon = total_active.saturating_sub(best_cov);
                 let mut scanned = 1usize;
+                let mut scanned_cells = Vec::new();
 
                 while scanned < MAX_TIE_SCAN {
                     let Some(&(Reverse(next_deg), _)) = multi_heap.peek() else {
@@ -447,24 +966,24 @@ where
                         continue;
                     }
                     scanned += 1;
-                    let Some(weight) =
-                        cell_total_weight(&degrees, &active, other_cell, &mut idx_buf)
-                    else {
+                    let (coverage, active_total) = cell_group_stats(&active, other_cell);
+                    if coverage == 0 {
                         degrees[other_cell] = 0;
                         continue;
-                    };
-
-                    if weight < best_weight {
-                        tied_cells.push(best_cell);
+                    }
+                    let abandon = active_total.saturating_sub(coverage);
+                    if abandon < best_abandon || (abandon == best_abandon && coverage > best_cov) {
+                        scanned_cells.push((Reverse(recorded_deg), best_cell));
                         best_cell = other_cell;
-                        best_weight = weight;
+                        best_abandon = abandon;
+                        best_cov = coverage;
                     } else {
-                        tied_cells.push(other_cell);
+                        scanned_cells.push((Reverse(recorded_deg), other_cell));
                     }
                 }
 
-                for cell in tied_cells {
-                    multi_heap.push((Reverse(recorded_deg), cell));
+                for cell in scanned_cells {
+                    multi_heap.push(cell);
                 }
 
                 break Some(best_cell);
@@ -492,16 +1011,50 @@ where
             // Place the "lightest" key (touching the lowest-degree cells), abandon the others.
             let mut keep_key = candidates[0];
             let mut best_weight = key_weight(&degrees, keep_key, &mut idx_buf);
-            for &candidate in &candidates[1..] {
+            let mut best_coverage = 0usize;
+            let mut keep_fp = F::from_hash(hashes[keep_key]);
+            for &candidate in &candidates {
                 let weight = key_weight(&degrees, candidate, &mut idx_buf);
-                if weight < best_weight {
+                let fp = F::from_hash(hashes[candidate]);
+                let mut coverage = 0usize;
+                for &other in &candidates {
+                    if active[other] && F::from_hash(hashes[other]) == fp {
+                        coverage += 1;
+                    }
+                }
+                if coverage > best_coverage || (coverage == best_coverage && weight < best_weight) {
+                    best_coverage = coverage;
                     best_weight = weight;
                     keep_key = candidate;
+                    keep_fp = fp;
                 }
             }
 
             active[keep_key] = false;
             stack.push((cell, keep_key));
+            drop_equivalent_keys(
+                keep_key,
+                cell,
+                &mut degrees,
+                &mut active,
+                &mut abandoned_keys,
+                &mut queue,
+                &mut multi_heap,
+                &mut idx_buf,
+                &mut tmp_idx_buf,
+            );
+            drop_same_fingerprint(
+                cell,
+                keep_fp,
+                keep_key,
+                &mut degrees,
+                &mut active,
+                &mut abandoned_keys,
+                &mut free_inserted,
+                &mut queue,
+                &mut multi_heap,
+                &mut tmp_idx_buf,
+            );
             let indexes = fill_indexes(hashes[keep_key], num_hashes, layout, &mut idx_buf);
             for &index in indexes {
                 if degrees[index] == 0 {
@@ -535,7 +1088,7 @@ where
                         multi_heap.push((Reverse(degrees[index]), index));
                     }
                 }
-            }
+                }
         }
 
         for (key_idx, is_active) in active.iter_mut().enumerate() {
@@ -545,17 +1098,17 @@ where
             }
         }
 
-        let mut fingerprints = vec![F::default(); array_len];
+        let mut fingerprints = F::Storage::new(array_len);
         while let Some((cell, key_idx)) = stack.pop() {
             let hash = hashes[key_idx];
             let indexes = fill_indexes(hash, num_hashes, layout, &mut idx_buf);
             let mut value = F::from_hash(hash);
             for &index in indexes {
                 if index != cell {
-                    value ^= fingerprints[index];
+                    value ^= fingerprints.get(index);
                 }
             }
-            fingerprints[cell] = value;
+            fingerprints.set(cell, value);
         }
 
         BuildOutput {
@@ -573,6 +1126,7 @@ where
             } else {
                 layout.array_length as f64 / keys.len() as f64
             },
+            free_inserted_keys: free_inserted,
         }
     }
 }
@@ -580,7 +1134,54 @@ where
 impl BinaryFuseFilter {
     /// Attempts to build an 8-bit fingerprint filter from the provided set of unique keys.
     pub fn build(keys: &[u64]) -> Result<BuildOutput, BuildError> {
-        Self::build_internal(keys, &FilterConfig::default())
+        Self::build_with_config(keys, &FilterConfig::default())
+    }
+
+    /// Attempts to build a 1-bit fingerprint filter from the provided set of unique keys.
+    pub fn build_1(keys: &[u64]) -> Result<BuildOutput1, BuildError> {
+        BinaryFuseFilter::<Fingerprint1>::build_with_config(keys, &FilterConfig::default())
+    }
+
+    /// Builds a 1-bit fingerprint filter using the supplied configuration.
+    pub fn build_1_with_config(
+        keys: &[u64],
+        config: &FilterConfig,
+    ) -> Result<BuildOutput1, BuildError> {
+        BinaryFuseFilter::<Fingerprint1>::build_with_config(keys, config)
+    }
+
+    /// Attempts to build a 2-bit fingerprint filter from the provided set of unique keys.
+    pub fn build_2(keys: &[u64]) -> Result<BuildOutput2, BuildError> {
+        BinaryFuseFilter::<Fingerprint2>::build_with_config(keys, &FilterConfig::default())
+    }
+
+    /// Builds a 2-bit fingerprint filter using the supplied configuration.
+    pub fn build_2_with_config(
+        keys: &[u64],
+        config: &FilterConfig,
+    ) -> Result<BuildOutput2, BuildError> {
+        BinaryFuseFilter::<Fingerprint2>::build_with_config(keys, config)
+    }
+
+    /// Attempts to build a 4-bit fingerprint filter from the provided set of unique keys.
+    pub fn build_4(keys: &[u64]) -> Result<BuildOutput4, BuildError> {
+        BinaryFuseFilter::<Fingerprint4>::build_with_config(keys, &FilterConfig::default())
+    }
+
+    /// Builds a 4-bit fingerprint filter using the supplied configuration.
+    pub fn build_4_with_config(
+        keys: &[u64],
+        config: &FilterConfig,
+    ) -> Result<BuildOutput4, BuildError> {
+        BinaryFuseFilter::<Fingerprint4>::build_with_config(keys, config)
+    }
+
+    /// Builds an 8-bit fingerprint filter using the supplied configuration.
+    pub fn build_8_with_config(
+        keys: &[u64],
+        config: &FilterConfig,
+    ) -> Result<BuildOutput, BuildError> {
+        Self::build_with_config(keys, config)
     }
 
     /// Builds an 8-bit fingerprint filter using the supplied configuration.
@@ -589,6 +1190,32 @@ impl BinaryFuseFilter {
         config: &FilterConfig,
     ) -> Result<BuildOutput, BuildError> {
         Self::build_internal(keys, config)
+    }
+
+    /// Attempts to build a 16-bit fingerprint filter from the provided set of unique keys.
+    pub fn build_16(keys: &[u64]) -> Result<BuildOutput16, BuildError> {
+        BinaryFuseFilter::<u16>::build_with_config(keys, &FilterConfig::default())
+    }
+
+    /// Builds a 16-bit fingerprint filter using the supplied configuration.
+    pub fn build_16_with_config(
+        keys: &[u64],
+        config: &FilterConfig,
+    ) -> Result<BuildOutput16, BuildError> {
+        BinaryFuseFilter::<u16>::build_with_config(keys, config)
+    }
+
+    /// Attempts to build a 32-bit fingerprint filter from the provided set of unique keys.
+    pub fn build_32(keys: &[u64]) -> Result<BuildOutput32, BuildError> {
+        BinaryFuseFilter::<u32>::build_with_config(keys, &FilterConfig::default())
+    }
+
+    /// Builds a 32-bit fingerprint filter using the supplied configuration.
+    pub fn build_32_with_config(
+        keys: &[u64],
+        config: &FilterConfig,
+    ) -> Result<BuildOutput32, BuildError> {
+        BinaryFuseFilter::<u32>::build_with_config(keys, config)
     }
 
     /// Builds a complete two-stage filter (8-bit main / 16-bit remainder) that eliminates false negatives.
@@ -669,6 +1296,46 @@ impl BinaryFuseFilter<u16> {
     }
 }
 
+impl BinaryFuseFilter<Fingerprint4> {
+    /// Builds a 4-bit fingerprint filter using the supplied configuration.
+    pub fn build_with_config(
+        keys: &[u64],
+        config: &FilterConfig,
+    ) -> Result<BuildOutput<Fingerprint4>, BuildError> {
+        Self::build_internal(keys, config)
+    }
+}
+
+impl BinaryFuseFilter<Fingerprint1> {
+    /// Builds a 1-bit fingerprint filter using the supplied configuration.
+    pub fn build_with_config(
+        keys: &[u64],
+        config: &FilterConfig,
+    ) -> Result<BuildOutput<Fingerprint1>, BuildError> {
+        Self::build_internal(keys, config)
+    }
+}
+
+impl BinaryFuseFilter<Fingerprint2> {
+    /// Builds a 2-bit fingerprint filter using the supplied configuration.
+    pub fn build_with_config(
+        keys: &[u64],
+        config: &FilterConfig,
+    ) -> Result<BuildOutput<Fingerprint2>, BuildError> {
+        Self::build_internal(keys, config)
+    }
+}
+
+impl BinaryFuseFilter<u32> {
+    /// Builds a 32-bit fingerprint filter using the supplied configuration.
+    pub fn build_with_config(
+        keys: &[u64],
+        config: &FilterConfig,
+    ) -> Result<BuildOutput<u32>, BuildError> {
+        Self::build_internal(keys, config)
+    }
+}
+
 impl<F> BinaryFuseFilter<F>
 where
     F: FingerprintValue,
@@ -686,12 +1353,13 @@ where
                     seed: 0,
                     num_hashes: config.num_hashes,
                     layout,
-                    fingerprints: Vec::new(),
+                    fingerprints: F::Storage::new(0),
                 },
                 abandoned_keys: Vec::new(),
                 total_slots: layout.array_length,
                 empty_slots: layout.array_length,
                 actual_overhead: 0.0,
+                free_inserted_keys: 0,
             });
         }
 
@@ -743,6 +1411,7 @@ where
         abandoned_keys: main_abandoned_keys,
         total_slots: main_total_slots,
         actual_overhead: main_actual_overhead,
+        free_inserted_keys: _,
         empty_slots: _,
     } = main_build;
 
@@ -1115,7 +1784,7 @@ fn fill_indexes<'a>(
 }
 
 #[inline]
-fn mixsplit(key: u64, seed: u64) -> u64 {
+pub fn mixsplit(key: u64, seed: u64) -> u64 {
     splitmix64(key.wrapping_add(seed))
 }
 
@@ -1135,8 +1804,11 @@ mod tests {
     #[test]
     fn deterministic_membership() {
         let keys: Vec<u64> = (0..10_000).map(|i| i as u64 * 13_791).collect();
-        let build = BinaryFuseFilter::build(&keys).expect("filter should build");
+        let build =
+            BinaryFuseFilter::<u8>::build_lossless_with_config(&keys, &FilterConfig::default())
+                .expect("filter should build");
         let abandoned: HashSet<u64> = build.abandoned_keys.iter().copied().collect();
+        assert!(abandoned.is_empty(), "lossless build should not abandon keys");
         let filter = build.filter;
 
         for &k in &keys {
@@ -1176,13 +1848,96 @@ mod tests {
             seed: 42,
         };
         let build =
-            BinaryFuseFilter::build_with_config(&keys, &config).expect("configurable filter");
+            BinaryFuseFilter::build_8_with_config(&keys, &config).expect("configurable filter");
         assert!(build.actual_overhead >= config.overhead);
         let filter = build.filter;
         for &k in &keys {
             assert!(filter.contains(k));
         }
         assert!(!filter.contains(999_999));
+    }
+
+    #[test]
+    fn sixteen_bit_filter_builds() {
+        let keys: Vec<u64> = (0..4_096).map(|i| splitmix64(i as u64)).collect();
+        let build = BinaryFuseFilter::build_16(&keys).expect("16-bit filter should build");
+        let abandoned: HashSet<u64> = build.abandoned_keys.iter().copied().collect();
+        let filter = build.filter;
+        for &k in &keys {
+            if !abandoned.contains(&k) {
+                assert!(filter.contains(k), "missing key: {}", k);
+            }
+        }
+    }
+
+    #[test]
+    fn thirty_two_bit_filter_builds() {
+        let keys: Vec<u64> = (0..4_096).map(|i| splitmix64(i as u64)).collect();
+        let build = BinaryFuseFilter::build_32(&keys).expect("32-bit filter should build");
+        let abandoned: HashSet<u64> = build.abandoned_keys.iter().copied().collect();
+        let filter = build.filter;
+        for &k in &keys {
+            if !abandoned.contains(&k) {
+                assert!(filter.contains(k), "missing key: {}", k);
+            }
+        }
+    }
+
+    #[test]
+    fn four_bit_filter_is_packed_and_builds() {
+        let keys: Vec<u64> = (0..2_048).map(|i| splitmix64(i as u64)).collect();
+        let build = BinaryFuseFilter::build_4(&keys).expect("4-bit filter should build");
+        let filter = build.filter;
+        let expected_bytes = (build.total_slots + 1) / 2;
+        assert_eq!(
+            filter.fingerprint_bytes(),
+            expected_bytes,
+            "4-bit storage should pack two entries per byte"
+        );
+        let abandoned: HashSet<u64> = build.abandoned_keys.iter().copied().collect();
+        for &k in &keys {
+            if !abandoned.contains(&k) {
+                assert!(filter.contains(k), "missing key: {}", k);
+            }
+        }
+    }
+
+    #[test]
+    fn two_bit_filter_is_packed_and_builds() {
+        let keys: Vec<u64> = (0..2_048).map(|i| splitmix64(i as u64)).collect();
+        let build = BinaryFuseFilter::build_2(&keys).expect("2-bit filter should build");
+        let filter = build.filter;
+        let expected_bytes = (build.total_slots + 3) / 4;
+        assert_eq!(
+            filter.fingerprint_bytes(),
+            expected_bytes,
+            "2-bit storage should pack four entries per byte"
+        );
+        let abandoned: HashSet<u64> = build.abandoned_keys.iter().copied().collect();
+        for &k in &keys {
+            if !abandoned.contains(&k) {
+                assert!(filter.contains(k), "missing key: {}", k);
+            }
+        }
+    }
+
+    #[test]
+    fn one_bit_filter_is_packed_and_builds() {
+        let keys: Vec<u64> = (0..1_024).map(|i| splitmix64(i as u64)).collect();
+        let build = BinaryFuseFilter::build_1(&keys).expect("1-bit filter should build");
+        let filter = build.filter;
+        let expected_bytes = (build.total_slots + 7) / 8;
+        assert_eq!(
+            filter.fingerprint_bytes(),
+            expected_bytes,
+            "1-bit storage should pack eight entries per byte"
+        );
+        let abandoned: HashSet<u64> = build.abandoned_keys.iter().copied().collect();
+        for &k in &keys {
+            if !abandoned.contains(&k) {
+                assert!(filter.contains(k), "missing key: {}", k);
+            }
+        }
     }
 
     #[test]
@@ -1194,7 +1949,7 @@ mod tests {
             seed: 123,
         };
         let build =
-            BinaryFuseFilter::build_with_config(&keys, &config).expect("higher arity filter");
+            BinaryFuseFilter::build_8_with_config(&keys, &config).expect("higher arity filter");
         let abandoned: HashSet<u64> = build.abandoned_keys.iter().copied().collect();
         assert!(build.actual_overhead >= config.overhead);
         let filter = build.filter;

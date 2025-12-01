@@ -126,3 +126,5 @@ impl fmt::Debug for FuseFilter {
             .finish()
     }
 }
+
+fn main() {}

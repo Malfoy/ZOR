@@ -7,7 +7,7 @@ use std::time::Instant;
 use zor_filter::{BinaryFuseFilter, CompleteFilterConfig, FilterConfig, PartitionConfig};
 
 fn main() {
-    let key_count = 10_000_000;
+    let key_count = 1_000_000;
     let query_count = 10_000_000;
 
     let keys: Vec<u64> = (0..key_count).map(|i| i as u64 * 13_791).collect();
