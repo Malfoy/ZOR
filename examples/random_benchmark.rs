@@ -28,8 +28,8 @@ fn main() {
 
 fn run_benchmark(cli: &Cli, num_hashes: usize) {
     println!(
-        "running {} iterations with key_count={}, overhead={}, num_hashes={}, threads={}",
-        cli.runs, cli.key_count, cli.overhead, num_hashes, cli.threads
+        "running {} iterations with key_count={}, query_count={}, overhead={}, num_hashes={}, threads={}",
+        cli.runs, cli.key_count, cli.query_count, cli.overhead, num_hashes, cli.threads
     );
 
     run_benchmark_for_fp::<Fingerprint1, _>(cli, num_hashes, "1-bit", 1.0, |keys, cfg| {
@@ -72,6 +72,7 @@ fn run_benchmark_for_fp<F, BuildFn>(
 
     let runs = cli.runs;
     let key_count = cli.key_count;
+    let query_count = cli.query_count;
 
     let counter = Arc::new(AtomicU32::new(0));
     let completed = Arc::new(AtomicU64::new(0));
@@ -83,6 +84,9 @@ fn run_benchmark_for_fp<F, BuildFn>(
     let total_bytes = Arc::new(AtomicU64::new(0));
     let total_aux_slots = Arc::new(AtomicU64::new(0));
     let total_aux_bytes = Arc::new(AtomicU64::new(0));
+    let total_false_negatives = Arc::new(AtomicU64::new(0));
+    let total_false_positives = Arc::new(AtomicU64::new(0));
+    let total_queries = Arc::new(AtomicU64::new(0));
     let progress_done = Arc::new(AtomicBool::new(false));
 
     let builder = Arc::new(builder);
@@ -98,10 +102,14 @@ fn run_benchmark_for_fp<F, BuildFn>(
         let total_bytes = Arc::clone(&total_bytes);
         let total_aux_slots = Arc::clone(&total_aux_slots);
         let total_aux_bytes = Arc::clone(&total_aux_bytes);
+        let total_false_negatives = Arc::clone(&total_false_negatives);
+        let total_false_positives = Arc::clone(&total_false_positives);
+        let total_queries = Arc::clone(&total_queries);
         let config = config;
         let builder = Arc::clone(&builder);
         let runs = runs;
         let key_count = key_count;
+        let query_count = query_count;
         let aux_overhead = cli.aux_overhead;
 
         let handle = thread::spawn(move || loop {
@@ -112,23 +120,32 @@ fn run_benchmark_for_fp<F, BuildFn>(
 
             let run_seed = derive_seed(config.seed, run as u64, worker_id as u64);
             let mut generator = SplitMix64::new(run_seed);
-            let keys = random_keys(key_count, &mut generator);
+            let mut keys = random_keys(key_count, &mut generator);
 
             let start = Instant::now();
             let build = builder(&keys, &config);
             let elapsed = start.elapsed().as_nanos() as u64;
 
             let filter = build.filter;
-            let abandoned = build.abandoned_keys.len() as u64;
             let total_slots_for_run = build.total_slots as u64;
             let empty_slots_for_run = build.empty_slots as u64;
             let fingerprint_bytes = filter.fingerprint_bytes() as u64;
             let free_keys = build.free_inserted_keys as u64;
+            let mut missed_keys = Vec::new();
+            missed_keys.reserve(build.abandoned_keys.len());
+            for &key in &keys {
+                if !filter.contains(key) {
+                    missed_keys.push(key);
+                }
+            }
+            let abandoned = missed_keys.len() as u64;
+
             let mut aux_bytes = 0u64;
             let mut aux_slots = 0u64;
-            if abandoned > 0 {
+            let mut aux_filter = None;
+            if !missed_keys.is_empty() {
                 let aux_build = FuseFilter::build(
-                    &build.abandoned_keys,
+                    &missed_keys,
                     &FuseFilterConfig {
                         overhead: aux_overhead,
                         seed: derive_seed(config.seed ^ 0xDEAD_BEEF_A55A_55AA, run as u64, worker_id as u64),
@@ -137,6 +154,35 @@ fn run_benchmark_for_fp<F, BuildFn>(
                 .expect("aux filter should build");
                 aux_slots = aux_build.total_slots as u64;
                 aux_bytes = aux_slots * mem::size_of::<u16>() as u64;
+                aux_filter = Some(aux_build.filter);
+            }
+
+            let mut false_negatives = 0u64;
+            if let Some(aux) = aux_filter.as_ref() {
+                for &key in &missed_keys {
+                    if !aux.contains(key) {
+                        false_negatives += 1;
+                    }
+                }
+            } else {
+                false_negatives = missed_keys.len() as u64;
+            }
+
+            let mut false_positives = 0u64;
+            if query_count > 0 {
+                keys.sort_unstable();
+                let query_seed_base = config.seed ^ 0xDEAD_BEEF_A55A_55AA;
+                let query_seed = derive_seed(query_seed_base, run as u64, worker_id as u64);
+                let mut query_generator = SplitMix64::new(query_seed);
+                for _ in 0..query_count {
+                    let key = query_generator.next();
+                    if contains_with_aux(&filter, aux_filter.as_ref(), key)
+                        && keys.binary_search(&key).is_err()
+                    {
+                        false_positives += 1;
+                    }
+                }
+                total_queries.fetch_add(query_count as u64, Ordering::Relaxed);
             }
 
             total_abandoned.fetch_add(abandoned, Ordering::Relaxed);
@@ -146,6 +192,8 @@ fn run_benchmark_for_fp<F, BuildFn>(
             total_bytes.fetch_add(fingerprint_bytes, Ordering::Relaxed);
             total_aux_slots.fetch_add(aux_slots, Ordering::Relaxed);
             total_aux_bytes.fetch_add(aux_bytes, Ordering::Relaxed);
+            total_false_negatives.fetch_add(false_negatives, Ordering::Relaxed);
+            total_false_positives.fetch_add(false_positives, Ordering::Relaxed);
             total_nanos.fetch_add(elapsed, Ordering::Relaxed);
             completed_runs.fetch_add(1, Ordering::Relaxed);
         });
@@ -284,6 +332,9 @@ fn run_benchmark_for_fp<F, BuildFn>(
         total_bytes.load(Ordering::Relaxed) + total_aux_bytes.load(Ordering::Relaxed);
     let total_aux_slots = total_aux_slots.load(Ordering::Relaxed);
     let total_free_keys = total_free_keys.load(Ordering::Relaxed);
+    let total_false_negatives = total_false_negatives.load(Ordering::Relaxed);
+    let total_false_positives = total_false_positives.load(Ordering::Relaxed);
+    let total_queries = total_queries.load(Ordering::Relaxed);
 
     if completed > 0 {
         let total_nanos = total_nanos.load(Ordering::Relaxed);
@@ -309,13 +360,27 @@ fn run_benchmark_for_fp<F, BuildFn>(
         } else {
             (total_empty_slots as f64 / total_slots as f64) * 100.0
         };
+        let false_negative_pct = if total_keys == 0 {
+            0.0
+        } else {
+            (total_false_negatives as f64 / total_keys as f64) * 100.0
+        };
+        let false_positive_pct = if total_queries == 0 {
+            0.0
+        } else {
+            (total_false_positives as f64 / total_queries as f64) * 100.0
+        };
         println!(
-            "[{label}] runs: {completed} | abandoned keys: {abandoned_pct:.4}% | bits/key: {bits_per_key:.4} | overhead: {overhead_pct:.2}% | free keys: {free_keys} | aux slots: {aux_slots} | mean empty slots: {mean_empty_pct:.4}% | mean build time: {mean_build_time:?}",
+            "[{label}] runs: {completed} | abandoned keys: {abandoned_pct:.4}% | bits/key: {bits_per_key:.4} | overhead: {overhead_pct:.2}% | free keys: {free_keys} | aux slots: {aux_slots} | false negatives: {fn_pct:.4}% ({fn_count}) | false positives: {fp_pct:.4}% ({fp_count}) | mean empty slots: {mean_empty_pct:.4}% | mean build time: {mean_build_time:?}",
             abandoned_pct = abandoned_rate * 100.0,
             bits_per_key = bits_per_key,
             overhead_pct = overhead_pct,
             free_keys = total_free_keys,
             aux_slots = total_aux_slots,
+            fn_pct = false_negative_pct,
+            fn_count = total_false_negatives,
+            fp_pct = false_positive_pct,
+            fp_count = total_false_positives,
             mean_empty_pct = mean_empty_pct,
             mean_build_time = mean
         );
@@ -324,9 +389,21 @@ fn run_benchmark_for_fp<F, BuildFn>(
     }
 }
 
+fn contains_with_aux<F: FingerprintValue>(
+    filter: &BinaryFuseFilter<F>,
+    aux: Option<&FuseFilter>,
+    key: u64,
+) -> bool {
+    if filter.contains(key) {
+        return true;
+    }
+    aux.map_or(false, |filter| filter.contains(key))
+}
+
 #[derive(Debug)]
 struct Cli {
     key_count: usize,
+    query_count: usize,
     overhead: f64,
     aux_overhead: f64,
     hash_counts: Vec<usize>,
@@ -338,10 +415,11 @@ struct Cli {
 impl Cli {
     fn from_env() -> Self {
         let mut cli = Self {
-            key_count: 10_000_000,
+            key_count: 1_000_000,
+            query_count: 10_000_000,
             overhead: 1.00,
             aux_overhead: 1.1,
-            hash_counts: vec![3, 4, 5, 6, 7, 8],
+            hash_counts: vec![ 6],
             runs: 32,
             seed: generate_seed(),
             threads: thread::available_parallelism()
@@ -349,6 +427,7 @@ impl Cli {
                 .unwrap_or(32),
         };
 
+        let mut query_count_set = false;
         let mut args = env::args().skip(1);
         while let Some(flag) = args.next() {
             fn parse<T: FromStr>(value: Option<String>, name: &str) -> T
@@ -362,7 +441,16 @@ impl Cli {
             }
 
             match flag.as_str() {
-                "--keys" => cli.key_count = parse(args.next(), "--keys"),
+                "--keys" => {
+                    cli.key_count = parse(args.next(), "--keys");
+                    if !query_count_set {
+                        cli.query_count = cli.key_count;
+                    }
+                }
+                "--queries" => {
+                    cli.query_count = parse(args.next(), "--queries");
+                    query_count_set = true;
+                }
                 "--overhead" => cli.overhead = parse(args.next(), "--overhead"),
                 "--aux-overhead" => cli.aux_overhead = parse(args.next(), "--aux-overhead"),
                 "--hashes" => cli.hash_counts = parse_hashes(args.next(), "--hashes"),

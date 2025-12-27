@@ -693,7 +693,7 @@ where
         let mut idx_buf = [0usize; MAX_HASHES];
         let mut hashes = Vec::with_capacity(keys.len());
         let mut active = vec![true; keys.len()];
-        let mut free_inserted = 0usize;
+        let free_inserted = 0usize;
 
         for &key in keys {
             let hash = mixsplit(key, seed);
@@ -807,43 +807,6 @@ where
             }
         };
 
-        let drop_same_fingerprint = |cell: usize,
-                                     fp: F,
-                                     skip_key: usize,
-                                     degrees: &mut [u32],
-                                     active: &mut [bool],
-                                     _abandoned: &mut Vec<u64>,
-                                     free_count: &mut usize,
-                                     queue: &mut Vec<usize>,
-                                     multi_heap: &mut BinaryHeap<(Reverse<u32>, usize)>,
-                                     tmp_buf: &mut [usize; MAX_HASHES]| {
-            let start = adjacency_offsets[cell];
-            let end = adjacency_offsets[cell + 1];
-            for pos in start..end {
-                let other_key = adjacency[pos] as usize;
-                if other_key == skip_key || !active[other_key] {
-                    continue;
-                }
-                if F::from_hash(hashes[other_key]) != fp {
-                    continue;
-                }
-                active[other_key] = false;
-                *free_count += 1;
-                let indexes = fill_indexes(hashes[other_key], num_hashes, layout, tmp_buf);
-                for &index in indexes {
-                    if degrees[index] == 0 {
-                        continue;
-                    }
-                    degrees[index] -= 1;
-                    if degrees[index] == 1 {
-                        queue.push(index);
-                    } else if degrees[index] > 1 {
-                        multi_heap.push((Reverse(degrees[index]), index));
-                    }
-                }
-            }
-        };
-
         while stack.len() + abandoned_keys.len() < keys.len() {
             let mut progress = false;
 
@@ -855,7 +818,6 @@ where
                 let start = adjacency_offsets[cell];
                 let end = adjacency_offsets[cell + 1];
                 let mut found_key = None;
-                let mut chosen_fp = None;
                 let mut fp_counts: Vec<(F, usize, usize)> = Vec::new();
                 for pos in start..end {
                     let key_idx = adjacency[pos] as usize;
@@ -870,16 +832,14 @@ where
                     }
                 }
 
-                if let Some((fp, _, key_idx)) =
+                if let Some((_, _, key_idx)) =
                     fp_counts.into_iter().max_by_key(|(_, count, _)| *count)
                 {
                     found_key = Some(key_idx);
-                    chosen_fp = Some(fp);
                 }
 
                 if let Some(key_idx) = found_key {
                     progress = true;
-                    let key_fp = chosen_fp.unwrap_or_else(|| F::from_hash(hashes[key_idx]));
                     active[key_idx] = false;
                     stack.push((cell, key_idx));
                     drop_equivalent_keys(
@@ -891,18 +851,6 @@ where
                         &mut queue,
                         &mut multi_heap,
                         &mut idx_buf,
-                        &mut tmp_idx_buf,
-                    );
-                    drop_same_fingerprint(
-                        cell,
-                        key_fp,
-                        key_idx,
-                        &mut degrees,
-                        &mut active,
-                        &mut abandoned_keys,
-                        &mut free_inserted,
-                        &mut queue,
-                        &mut multi_heap,
                         &mut tmp_idx_buf,
                     );
 
@@ -1012,7 +960,6 @@ where
             let mut keep_key = candidates[0];
             let mut best_weight = key_weight(&degrees, keep_key, &mut idx_buf);
             let mut best_coverage = 0usize;
-            let mut keep_fp = F::from_hash(hashes[keep_key]);
             for &candidate in &candidates {
                 let weight = key_weight(&degrees, candidate, &mut idx_buf);
                 let fp = F::from_hash(hashes[candidate]);
@@ -1026,7 +973,6 @@ where
                     best_coverage = coverage;
                     best_weight = weight;
                     keep_key = candidate;
-                    keep_fp = fp;
                 }
             }
 
@@ -1041,18 +987,6 @@ where
                 &mut queue,
                 &mut multi_heap,
                 &mut idx_buf,
-                &mut tmp_idx_buf,
-            );
-            drop_same_fingerprint(
-                cell,
-                keep_fp,
-                keep_key,
-                &mut degrees,
-                &mut active,
-                &mut abandoned_keys,
-                &mut free_inserted,
-                &mut queue,
-                &mut multi_heap,
                 &mut tmp_idx_buf,
             );
             let indexes = fill_indexes(hashes[keep_key], num_hashes, layout, &mut idx_buf);
