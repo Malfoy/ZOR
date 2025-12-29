@@ -4,7 +4,9 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
 
-use zor_filter::{BinaryFuseFilter, CompleteFilterConfig, FilterConfig, PartitionConfig};
+use zor_filter::{
+    BinaryFuseFilter, CompleteFilterConfig, CycleBreakHeuristic, FilterConfig, PartitionConfig,
+};
 
 fn main() {
     let key_count = 1_000_000;
@@ -47,6 +49,7 @@ fn main() {
         overhead,
         num_hashes,
         tie_scan: 8,
+        cycle_break: CycleBreakHeuristic::MostDeg2,
         seed,
     };
     let remainder_overhead = overhead.max(1.1);
@@ -54,6 +57,7 @@ fn main() {
         overhead: remainder_overhead,
         num_hashes,
         tie_scan: 8,
+        cycle_break: CycleBreakHeuristic::MostDeg2,
         seed: seed ^ 0xD6E8_FEB8_6659_FD93,
     };
     let complete_config = CompleteFilterConfig {

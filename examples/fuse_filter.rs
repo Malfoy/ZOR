@@ -1,7 +1,9 @@
 use std::fmt;
 use std::mem;
 
-use zor_filter::{BinaryFuseFilter, BuildError, BuildOutput, FilterConfig, FingerprintValue};
+use zor_filter::{
+    BinaryFuseFilter, BuildError, BuildOutput, CycleBreakHeuristic, FilterConfig, FingerprintValue,
+};
 
 /// Configuration for the auxiliary binary fuse filter.
 #[derive(Clone, Copy, Debug)]
@@ -50,6 +52,7 @@ impl<F: FingerprintValue> FuseFilter<F> {
                             overhead: config.overhead.max(1.0),
                             num_hashes: 4,
                             tie_scan: 8,
+                            cycle_break: CycleBreakHeuristic::MostDeg2,
                             seed: config.seed,
                         },
                     )
@@ -68,6 +71,7 @@ impl<F: FingerprintValue> FuseFilter<F> {
             overhead: config.overhead.max(1.0),
             num_hashes: 4,
             tie_scan: 8,
+            cycle_break: CycleBreakHeuristic::MostDeg2,
             seed: config.seed,
         };
         let BuildOutput {

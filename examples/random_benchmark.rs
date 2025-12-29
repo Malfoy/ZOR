@@ -10,8 +10,8 @@ mod fuse_filter;
 
 use fuse_filter::{FuseFilter, FuseFilterConfig};
 use zor_filter::{
-    BinaryFuseFilter, BuildOutput, FilterConfig, Fingerprint1, Fingerprint2, Fingerprint4,
-    Fingerprint24, Fingerprint40, FingerprintValue,
+    BinaryFuseFilter, BuildOutput, CycleBreakHeuristic, FilterConfig, Fingerprint1, Fingerprint2,
+    Fingerprint4, Fingerprint24, Fingerprint40, FingerprintValue,
 };
 
 trait AuxFingerprintAdd<const ADD_BYTES: usize> {
@@ -102,16 +102,32 @@ fn main() {
 }
 
 macro_rules! run_benchmark_set {
-    ($add:expr, $cli:expr, $num_hashes:expr) => {{
-        run_benchmark_for_fp::<u8, $add, _>($cli, $num_hashes, "8-bit", 8.0, |keys, cfg| {
-            BinaryFuseFilter::build_8_with_config(keys, cfg).expect("8-bit filter should build")
-        });
-        run_benchmark_for_fp::<u16, $add, _>($cli, $num_hashes, "16-bit", 16.0, |keys, cfg| {
-            BinaryFuseFilter::build_16_with_config(keys, cfg).expect("16-bit filter should build")
-        });
+    ($add:expr, $cli:expr, $num_hashes:expr, $cycle_break:expr) => {{
+        run_benchmark_for_fp::<u8, $add, _>(
+            $cli,
+            $num_hashes,
+            $cycle_break,
+            "8-bit",
+            8.0,
+            |keys, cfg| {
+                BinaryFuseFilter::build_8_with_config(keys, cfg).expect("8-bit filter should build")
+            },
+        );
+        run_benchmark_for_fp::<u16, $add, _>(
+            $cli,
+            $num_hashes,
+            $cycle_break,
+            "16-bit",
+            16.0,
+            |keys, cfg| {
+                BinaryFuseFilter::build_16_with_config(keys, cfg)
+                    .expect("16-bit filter should build")
+            },
+        );
         run_benchmark_for_fp::<Fingerprint24, $add, _>(
             $cli,
             $num_hashes,
+            $cycle_break,
             "24-bit",
             24.0,
             |keys, cfg| {
@@ -119,37 +135,52 @@ macro_rules! run_benchmark_set {
                     .expect("24-bit filter should build")
             },
         );
-        run_benchmark_for_fp::<u32, $add, _>($cli, $num_hashes, "32-bit", 32.0, |keys, cfg| {
-            BinaryFuseFilter::build_32_with_config(keys, cfg).expect("32-bit filter should build")
-        });
+        run_benchmark_for_fp::<u32, $add, _>(
+            $cli,
+            $num_hashes,
+            $cycle_break,
+            "32-bit",
+            32.0,
+            |keys, cfg| {
+                BinaryFuseFilter::build_32_with_config(keys, cfg)
+                    .expect("32-bit filter should build")
+            },
+        );
     }};
 }
 
 fn run_benchmark(cli: &Cli, num_hashes: usize) {
-    println!(
-        "running {} iterations with key_count={}, query_count={}, overhead={}, num_hashes={}, threads={}, cascade={}, aux_add_bytes={}, tie_scan={}",
-        cli.runs,
-        cli.key_count,
-        cli.query_count,
-        cli.overhead,
-        num_hashes,
-        cli.threads,
-        cli.cascade,
-        cli.aux_add_bytes,
-        cli.tie_scan
-    );
+    for (idx, &cycle_break) in cli.cycle_breaks.iter().enumerate() {
+        if idx > 0 {
+            println!();
+        }
+        println!("-- cycle_break={} --", cycle_break_label(cycle_break));
+        println!(
+            "running {} iterations with key_count={}, query_count={}, overhead={}, num_hashes={}, threads={}, cascade={}, aux_add_bytes={}, tie_scan={}, cycle_break={}",
+            cli.runs,
+            cli.key_count,
+            cli.query_count,
+            cli.overhead,
+            num_hashes,
+            cli.threads,
+            cli.cascade,
+            cli.aux_add_bytes,
+            cli.tie_scan,
+            cycle_break_label(cycle_break)
+        );
 
-    match cli.aux_add_bytes {
-        0 => run_benchmark_set!(0, cli, num_hashes),
-        1 => run_benchmark_set!(1, cli, num_hashes),
-        2 => run_benchmark_set!(2, cli, num_hashes),
-        3 => run_benchmark_set!(3, cli, num_hashes),
-        4 => run_benchmark_set!(4, cli, num_hashes),
-        other => {
-            eprintln!(
-                "aux_add_bytes={other} unsupported, clamping to 4 (u64 aux fingerprints)"
-            );
-            run_benchmark_set!(4, cli, num_hashes);
+        match cli.aux_add_bytes {
+            0 => run_benchmark_set!(0, cli, num_hashes, cycle_break),
+            1 => run_benchmark_set!(1, cli, num_hashes, cycle_break),
+            2 => run_benchmark_set!(2, cli, num_hashes, cycle_break),
+            3 => run_benchmark_set!(3, cli, num_hashes, cycle_break),
+            4 => run_benchmark_set!(4, cli, num_hashes, cycle_break),
+            other => {
+                eprintln!(
+                    "aux_add_bytes={other} unsupported, clamping to 4 (u64 aux fingerprints)"
+                );
+                run_benchmark_set!(4, cli, num_hashes, cycle_break);
+            }
         }
     }
 }
@@ -157,6 +188,7 @@ fn run_benchmark(cli: &Cli, num_hashes: usize) {
 fn run_benchmark_for_fp<F, const ADD_BYTES: usize, BuildFn>(
     cli: &Cli,
     num_hashes: usize,
+    cycle_break: CycleBreakHeuristic,
     label: &'static str,
     fingerprint_bits: f64,
     builder: BuildFn,
@@ -170,6 +202,7 @@ fn run_benchmark_for_fp<F, const ADD_BYTES: usize, BuildFn>(
         overhead: cli.overhead,
         num_hashes,
         tie_scan: cli.tie_scan,
+        cycle_break,
         seed: cli.seed,
     };
 
@@ -598,6 +631,7 @@ struct Cli {
     aux_overhead: f64,
     aux_add_bytes: usize,
     tie_scan: usize,
+    cycle_breaks: Vec<CycleBreakHeuristic>,
     cascade: bool,
     hash_counts: Vec<usize>,
     runs: u32,
@@ -614,6 +648,7 @@ impl Cli {
             aux_overhead: 1.01,
             aux_add_bytes: 1,
             tie_scan: 8,
+            cycle_breaks: default_cycle_breaks(),
             cascade: false,
             hash_counts: vec![8],
             runs: 32,
@@ -651,6 +686,9 @@ impl Cli {
                 "--aux-overhead" => cli.aux_overhead = parse(args.next(), "--aux-overhead"),
                 "--aux-add-bytes" => cli.aux_add_bytes = parse(args.next(), "--aux-add-bytes"),
                 "--tie-scan" => cli.tie_scan = parse(args.next(), "--tie-scan"),
+                "--cycle-break" => {
+                    cli.cycle_breaks = parse_cycle_breaks(args.next(), "--cycle-break")
+                }
                 "--cascade" => cli.cascade = true,
                 "--hashes" => cli.hash_counts = parse_hashes(args.next(), "--hashes"),
                 "--runs" => cli.runs = parse(args.next(), "--runs"),
@@ -681,6 +719,55 @@ fn parse_hashes(value: Option<String>, name: &str) -> Vec<usize> {
     }
 
     hashes
+}
+
+fn default_cycle_breaks() -> Vec<CycleBreakHeuristic> {
+    vec![CycleBreakHeuristic::MostDeg2]
+}
+
+fn cycle_break_label(heuristic: CycleBreakHeuristic) -> &'static str {
+    match heuristic {
+        CycleBreakHeuristic::Lightest => "lightest",
+        CycleBreakHeuristic::Heaviest => "heaviest",
+        CycleBreakHeuristic::MostDeg2 => "most-deg2",
+        CycleBreakHeuristic::MinMaxDegree => "min-max-degree",
+    }
+}
+
+fn parse_cycle_breaks(value: Option<String>, name: &str) -> Vec<CycleBreakHeuristic> {
+    let value = value.unwrap_or_else(|| panic!("expected value after {name}"));
+    let mut heuristics = Vec::new();
+    for part in value.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        heuristics.push(parse_cycle_break(part));
+    }
+
+    if heuristics.is_empty() {
+        panic!("expected at least one value after {name}");
+    }
+
+    heuristics
+}
+
+fn parse_cycle_break(value: &str) -> CycleBreakHeuristic {
+    let normalized: String = value
+        .chars()
+        .filter(|c| *c != '-' && *c != '_' && !c.is_whitespace())
+        .flat_map(|c| c.to_lowercase())
+        .collect();
+
+    match normalized.as_str() {
+        "lightest" | "minweight" | "minsum" => CycleBreakHeuristic::Lightest,
+        "heaviest" | "maxweight" | "maxsum" => CycleBreakHeuristic::Heaviest,
+        "mostdeg2" | "deg2" | "most2" => CycleBreakHeuristic::MostDeg2,
+        "minmaxdegree" | "minmax" | "minmaxdeg" => CycleBreakHeuristic::MinMaxDegree,
+        _ => panic!(
+            "unknown cycle break heuristic: {value} (valid: lightest, heaviest, most-deg2, min-max-degree)"
+        ),
+    }
 }
 
 fn random_keys(count: usize, generator: &mut SplitMix64) -> Vec<u64> {

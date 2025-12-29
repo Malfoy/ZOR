@@ -403,6 +403,25 @@ pub enum BuildError {
     ConstructionFailed(&'static str),
 }
 
+/// Heuristic used when abandoning keys to break cycles.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CycleBreakHeuristic {
+    /// Pick the key with the smallest sum of degrees.
+    Lightest,
+    /// Pick the key with the largest sum of degrees.
+    Heaviest,
+    /// Prefer keys that touch many low-degree cells (degree-2 first, then 3, and so on).
+    MostDeg2,
+    /// Pick the key with the smallest maximum degree.
+    MinMaxDegree,
+}
+
+impl Default for CycleBreakHeuristic {
+    fn default() -> Self {
+        CycleBreakHeuristic::MostDeg2
+    }
+}
+
 /// Configuration options for building a [`BinaryFuseFilter`].
 #[derive(Clone, Copy, Debug)]
 pub struct FilterConfig {
@@ -412,6 +431,8 @@ pub struct FilterConfig {
     pub num_hashes: usize,
     /// Number of tied high-degree cells to scan when breaking cycles.
     pub tie_scan: usize,
+    /// Heuristic used when abandoning keys to break cycles.
+    pub cycle_break: CycleBreakHeuristic,
     /// Seed used for hashing.
     pub seed: u64,
 }
@@ -422,6 +443,7 @@ impl Default for FilterConfig {
             overhead: 1.0,
             num_hashes: 8,
             tie_scan: 8,
+            cycle_break: CycleBreakHeuristic::MostDeg2,
             seed: 69,
         }
     }
@@ -444,6 +466,7 @@ impl Default for CompleteFilterConfig {
             seed: main.seed ^ 0xD6E8_FEB8_6659_FD93,
             num_hashes: main.num_hashes,
             tie_scan: main.tie_scan,
+            cycle_break: main.cycle_break,
         };
         Self { main, remainder }
     }
@@ -854,8 +877,14 @@ where
             });
         }
 
-        let mut best_build =
-            Self::build_with_seed(keys, config.seed, config.num_hashes, layout, config.tie_scan);
+        let mut best_build = Self::build_with_seed(
+            keys,
+            config.seed,
+            config.num_hashes,
+            layout,
+            config.tie_scan,
+            config.cycle_break,
+        );
         let mut best_abandoned = best_build.abandoned_keys.len();
         if best_abandoned == 0 || MAX_BEST_EFFORT_ATTEMPTS <= 1 {
             return Ok(best_build);
@@ -864,8 +893,14 @@ where
         let mut attempt_seed = config.seed;
         for _ in 1..MAX_BEST_EFFORT_ATTEMPTS {
             attempt_seed = splitmix64(attempt_seed);
-            let candidate =
-                Self::build_with_seed(keys, attempt_seed, config.num_hashes, layout, config.tie_scan);
+            let candidate = Self::build_with_seed(
+                keys,
+                attempt_seed,
+                config.num_hashes,
+                layout,
+                config.tie_scan,
+                config.cycle_break,
+            );
             let abandoned = candidate.abandoned_keys.len();
             if abandoned < best_abandoned {
                 best_abandoned = abandoned;
@@ -916,6 +951,7 @@ where
         num_hashes: usize,
         layout: Layout,
         tie_scan: usize,
+        cycle_break: CycleBreakHeuristic,
     ) -> BuildOutput<F> {
         let array_len = layout.array_length;
         let mut degrees = vec![0u32; array_len];
@@ -968,10 +1004,126 @@ where
             }
         }
 
-        let key_weight =
-            |degrees: &[u32], key_idx: usize, idx_buf: &mut [usize; MAX_HASHES]| -> u64 {
+        #[derive(Clone, Copy)]
+        struct KeyStats {
+            sum_degrees: u64,
+            max_degree: u32,
+            deg2_count: u8,
+            degrees: [u32; MAX_HASHES],
+            len: usize,
+        }
+
+        let key_stats =
+            |degrees: &[u32], key_idx: usize, idx_buf: &mut [usize; MAX_HASHES]| -> KeyStats {
                 let indexes = fill_indexes(hashes[key_idx], num_hashes, layout, idx_buf);
-            indexes.iter().map(|&index| degrees[index] as u64).sum()
+                let mut sum_degrees = 0u64;
+                let mut max_degree = 0u32;
+                let mut deg2_count = 0u8;
+                let mut degrees_buf = [0u32; MAX_HASHES];
+                let len = indexes.len();
+                for (slot, &index) in indexes.iter().enumerate() {
+                    let degree = degrees[index];
+                    sum_degrees += degree as u64;
+                    if degree > max_degree {
+                        max_degree = degree;
+                    }
+                    if degree == 2 {
+                        deg2_count = deg2_count.saturating_add(1);
+                    }
+                    degrees_buf[slot] = degree;
+                }
+                degrees_buf[..len].sort_unstable();
+                KeyStats {
+                    sum_degrees,
+                    max_degree,
+                    deg2_count,
+                    degrees: degrees_buf,
+                    len,
+                }
+            };
+
+        let better_key = |candidate: KeyStats, best: KeyStats| -> bool {
+            match cycle_break {
+                CycleBreakHeuristic::Lightest => {
+                    if candidate.sum_degrees != best.sum_degrees {
+                        candidate.sum_degrees < best.sum_degrees
+                    } else if candidate.deg2_count != best.deg2_count {
+                        candidate.deg2_count > best.deg2_count
+                    } else {
+                        candidate.max_degree < best.max_degree
+                    }
+                }
+                CycleBreakHeuristic::Heaviest => {
+                    if candidate.sum_degrees != best.sum_degrees {
+                        candidate.sum_degrees > best.sum_degrees
+                    } else if candidate.deg2_count != best.deg2_count {
+                        candidate.deg2_count < best.deg2_count
+                    } else {
+                        candidate.max_degree > best.max_degree
+                    }
+                }
+                CycleBreakHeuristic::MostDeg2 => {
+                    let len = candidate.len.min(best.len);
+                    for idx in 0..len {
+                        let a = candidate.degrees[idx];
+                        let b = best.degrees[idx];
+                        if a != b {
+                            return a < b;
+                        }
+                    }
+                    if candidate.sum_degrees != best.sum_degrees {
+                        candidate.sum_degrees < best.sum_degrees
+                    } else {
+                        candidate.max_degree < best.max_degree
+                    }
+                }
+                CycleBreakHeuristic::MinMaxDegree => {
+                    if candidate.max_degree != best.max_degree {
+                        candidate.max_degree < best.max_degree
+                    } else if candidate.sum_degrees != best.sum_degrees {
+                        candidate.sum_degrees < best.sum_degrees
+                    } else {
+                        candidate.deg2_count > best.deg2_count
+                    }
+                }
+            }
+        };
+
+        let best_key_for_cell = |cell: usize,
+                                 active: &[bool],
+                                 degrees: &[u32],
+                                 idx_buf: &mut [usize; MAX_HASHES]|
+         -> Option<(usize, KeyStats)> {
+            let start = adjacency_offsets[cell];
+            let end = adjacency_offsets[cell + 1];
+            let mut best_key = None;
+            let mut best_stats = KeyStats {
+                sum_degrees: 0,
+                max_degree: 0,
+                deg2_count: 0,
+                degrees: [0; MAX_HASHES],
+                len: 0,
+            };
+            for pos in start..end {
+                let key_idx = adjacency[pos] as usize;
+                if !active[key_idx] {
+                    continue;
+                }
+                let stats = key_stats(degrees, key_idx, idx_buf);
+                match best_key {
+                    None => {
+                        best_key = Some(key_idx);
+                        best_stats = stats;
+                    }
+                    Some(_) => {
+                        if better_key(stats, best_stats) {
+                            best_key = Some(key_idx);
+                            best_stats = stats;
+                        }
+                    }
+                }
+            }
+            best_key.map(|key| (key, best_stats))
         };
 
         while stack.len() + abandoned_keys.len() < keys.len() {
@@ -1033,43 +1185,21 @@ where
                     continue;
                 }
                 let mut best_cell = cell;
-                let mut best_min_weight = u64::MAX;
+                let mut best_key = None;
+                let mut best_stats = KeyStats {
+                    sum_degrees: 0,
+                    max_degree: 0,
+                    deg2_count: 0,
+                    degrees: [0; MAX_HASHES],
+                    len: 0,
+                };
                 let mut scanned_cells = Vec::new();
                 let mut scanned = 0usize;
-
-                let min_weight_for_cell = |cell: usize,
-                                           active: &[bool],
-                                           degrees: &[u32],
-                                           idx_buf: &mut [usize; MAX_HASHES]|
-                 -> Option<u64> {
-                    let start = adjacency_offsets[cell];
-                    let end = adjacency_offsets[cell + 1];
-                    let mut min_weight = u64::MAX;
-                    for pos in start..end {
-                        let key_idx = adjacency[pos] as usize;
-                        if !active[key_idx] {
-                            continue;
-                        }
-                        let weight = key_weight(degrees, key_idx, idx_buf);
-                        if weight < min_weight {
-                            min_weight = weight;
-                        }
-                    }
-                    if min_weight == u64::MAX {
-                        None
-                    } else {
-                        Some(min_weight)
-                    }
-                };
-
-                if let Some(min_weight) =
-                    min_weight_for_cell(cell, &active, &degrees, &mut idx_buf)
+                if let Some((key_idx, stats)) =
+                    best_key_for_cell(cell, &active, &degrees, &mut idx_buf)
                 {
-                    if min_weight < best_min_weight {
-                        best_min_weight = min_weight;
-                    } else {
-                        scanned_cells.push((Reverse(recorded_deg), cell));
-                    }
+                    best_key = Some(key_idx);
+                    best_stats = stats;
                     scanned += 1;
                 } else {
                     degrees[cell] = 0;
@@ -1087,17 +1217,25 @@ where
                     if current_deg <= 1 || current_deg != recorded_deg {
                         continue;
                     }
-                    if let Some(min_weight) =
-                        min_weight_for_cell(other_cell, &active, &degrees, &mut idx_buf)
+                    if let Some((key_idx, stats)) =
+                        best_key_for_cell(other_cell, &active, &degrees, &mut idx_buf)
                     {
-                        if min_weight < best_min_weight {
-                            scanned_cells.push((Reverse(recorded_deg), best_cell));
-                            best_cell = other_cell;
-                            best_min_weight = min_weight;
+                        if best_key.is_some() {
+                            if better_key(stats, best_stats) {
+                                scanned_cells.push((Reverse(recorded_deg), best_cell));
+                                best_cell = other_cell;
+                                best_key = Some(key_idx);
+                                best_stats = stats;
+                            } else {
+                                scanned_cells.push((Reverse(recorded_deg), other_cell));
+                            }
+                            scanned += 1;
                         } else {
-                            scanned_cells.push((Reverse(recorded_deg), other_cell));
+                            best_cell = other_cell;
+                            best_key = Some(key_idx);
+                            best_stats = stats;
+                            scanned += 1;
                         }
-                        scanned += 1;
                     } else {
                         degrees[other_cell] = 0;
                     }
@@ -1107,14 +1245,14 @@ where
                     multi_heap.push(cell);
                 }
 
-                if best_min_weight == u64::MAX {
+                let Some(best_key) = best_key else {
                     continue;
-                }
+                };
 
-                break Some(best_cell);
+                break Some((best_cell, best_key));
             };
 
-            let Some(cell) = candidate else {
+            let Some((_cell, abandon_key)) = candidate else {
                 let Some((abandon_key, _)) = active.iter().enumerate().find(|(_, &a)| a) else {
                     break;
                 };
@@ -1134,33 +1272,6 @@ where
                 }
                 continue;
             };
-
-            let start = adjacency_offsets[cell];
-            let end = adjacency_offsets[cell + 1];
-            let mut candidates = Vec::new();
-            for pos in start..end {
-                let key_idx = adjacency[pos] as usize;
-                if active[key_idx] {
-                    candidates.push(key_idx);
-                }
-            }
-
-            if candidates.is_empty() {
-                degrees[cell] = 0;
-                continue;
-            }
-
-            // Abandon a single key to break the cycle, preferring the lightest key to leave
-            // heavier constraints that can drive new degree-1 cells.
-            let mut abandon_key = candidates[0];
-            let mut best_weight = key_weight(&degrees, abandon_key, &mut idx_buf);
-            for &candidate in &candidates[1..] {
-                let weight = key_weight(&degrees, candidate, &mut idx_buf);
-                if weight < best_weight {
-                    best_weight = weight;
-                    abandon_key = candidate;
-                }
-            }
 
             active[abandon_key] = false;
             abandoned_keys.push(keys[abandon_key]);
@@ -1500,6 +1611,7 @@ where
                 overhead,
                 num_hashes: config.num_hashes,
                 tie_scan: config.tie_scan,
+                cycle_break: config.cycle_break,
                 seed: attempt_seed,
             };
             let layout = calculate_layout(keys.len(), &attempt_config)?;
@@ -2108,6 +2220,7 @@ mod tests {
             overhead: 1.35,
             num_hashes: 4,
             tie_scan: 8,
+            cycle_break: CycleBreakHeuristic::MostDeg2,
             seed: 42,
         };
         let build =
@@ -2210,6 +2323,7 @@ mod tests {
             overhead: 1.5,
             num_hashes: 7,
             tie_scan: 8,
+            cycle_break: CycleBreakHeuristic::MostDeg2,
             seed: 123,
         };
         let build =
@@ -2266,6 +2380,7 @@ mod tests {
             overhead: 1.0,
             num_hashes: 8,
             tie_scan: 8,
+            cycle_break: CycleBreakHeuristic::MostDeg2,
             seed: 123,
         };
         let build = BinaryFuseFilter::<u16>::build_lossless_with_config_internal(
