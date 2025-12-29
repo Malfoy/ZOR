@@ -16,9 +16,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const MAX_HASHES: usize = 32;
-const MAX_SEGMENT_LENGTH_LOG: u32 = 11;
+const MAX_SEGMENT_LENGTH_LOG: u32 = 12;
 const MAX_BINARY_FUSE_ATTEMPTS: usize = 32;
-const MAX_TIE_SCAN: usize = 8;
+const MAX_LOSSLESS_FIXED_ATTEMPTS: usize = 512;
+const MAX_BEST_EFFORT_ATTEMPTS: usize = 1;
 
 #[derive(Clone, Copy, Debug)]
 struct Layout {
@@ -58,6 +59,28 @@ impl Fingerprint2 {
     #[inline]
     fn mask(self) -> u8 {
         self.0 & 0x03
+    }
+}
+
+/// A 24-bit fingerprint representation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Fingerprint24(u32);
+
+impl Fingerprint24 {
+    #[inline]
+    fn mask(self) -> u32 {
+        self.0 & 0x00FF_FFFF
+    }
+}
+
+/// A 40-bit fingerprint representation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Fingerprint40(u64);
+
+impl Fingerprint40 {
+    #[inline]
+    fn mask(self) -> u64 {
+        self.0 & 0xFFFF_FFFFFF
     }
 }
 
@@ -124,6 +147,16 @@ pub struct PackedFingerprintStorage1 {
 }
 
 pub struct PackedFingerprintStorage2 {
+    data: Vec<u8>,
+    len: usize,
+}
+
+pub struct PackedFingerprintStorage24 {
+    data: Vec<u8>,
+    len: usize,
+}
+
+pub struct PackedFingerprintStorage40 {
     data: Vec<u8>,
     len: usize,
 }
@@ -265,6 +298,102 @@ impl FingerprintStorage for PackedFingerprintStorage2 {
     }
 }
 
+impl FingerprintStorage for PackedFingerprintStorage24 {
+    type Fingerprint = Fingerprint24;
+
+    #[inline]
+    fn new(len: usize) -> Self {
+        let bytes = len.saturating_mul(3);
+        Self {
+            data: vec![0u8; bytes],
+            len,
+        }
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    #[inline]
+    fn get(&self, index: usize) -> Self::Fingerprint {
+        let base = index * 3;
+        let b0 = self.data[base] as u32;
+        let b1 = self.data[base + 1] as u32;
+        let b2 = self.data[base + 2] as u32;
+        Fingerprint24((b2 << 16) | (b1 << 8) | b0)
+    }
+
+    #[inline]
+    fn set(&mut self, index: usize, value: Self::Fingerprint) {
+        let masked = value.mask();
+        let base = index * 3;
+        self.data[base] = masked as u8;
+        self.data[base + 1] = (masked >> 8) as u8;
+        self.data[base + 2] = (masked >> 16) as u8;
+    }
+
+    #[inline]
+    fn byte_size(&self) -> usize {
+        self.data.len()
+    }
+}
+
+impl FingerprintStorage for PackedFingerprintStorage40 {
+    type Fingerprint = Fingerprint40;
+
+    #[inline]
+    fn new(len: usize) -> Self {
+        let bytes = len.saturating_mul(5);
+        Self {
+            data: vec![0u8; bytes],
+            len,
+        }
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    #[inline]
+    fn get(&self, index: usize) -> Self::Fingerprint {
+        let base = index * 5;
+        let b0 = self.data[base] as u64;
+        let b1 = self.data[base + 1] as u64;
+        let b2 = self.data[base + 2] as u64;
+        let b3 = self.data[base + 3] as u64;
+        let b4 = self.data[base + 4] as u64;
+        Fingerprint40((b4 << 32) | (b3 << 24) | (b2 << 16) | (b1 << 8) | b0)
+    }
+
+    #[inline]
+    fn set(&mut self, index: usize, value: Self::Fingerprint) {
+        let masked = value.mask();
+        let base = index * 5;
+        self.data[base] = masked as u8;
+        self.data[base + 1] = (masked >> 8) as u8;
+        self.data[base + 2] = (masked >> 16) as u8;
+        self.data[base + 3] = (masked >> 24) as u8;
+        self.data[base + 4] = (masked >> 32) as u8;
+    }
+
+    #[inline]
+    fn byte_size(&self) -> usize {
+        self.data.len()
+    }
+}
+
 /// Error returned when construction of the filter fails.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BuildError {
@@ -281,6 +410,8 @@ pub struct FilterConfig {
     pub overhead: f64,
     /// Number of hash functions used by the filter (between 3 and 16).
     pub num_hashes: usize,
+    /// Number of tied high-degree cells to scan when breaking cycles.
+    pub tie_scan: usize,
     /// Seed used for hashing.
     pub seed: u64,
 }
@@ -290,6 +421,7 @@ impl Default for FilterConfig {
         Self {
             overhead: 1.0,
             num_hashes: 8,
+            tie_scan: 8,
             seed: 69,
         }
     }
@@ -308,9 +440,10 @@ impl Default for CompleteFilterConfig {
     fn default() -> Self {
         let main = FilterConfig::default();
         let remainder = FilterConfig {
-            overhead: main.overhead.max(1.1),
+            overhead: main.overhead.max(1.3),
             seed: main.seed ^ 0xD6E8_FEB8_6659_FD93,
             num_hashes: main.num_hashes,
+            tie_scan: main.tie_scan,
         };
         Self { main, remainder }
     }
@@ -530,6 +663,15 @@ impl FingerprintValue for u32 {
     }
 }
 
+impl FingerprintValue for u64 {
+    type Storage = PlainFingerprintStorage<u64>;
+
+    #[inline]
+    fn from_hash(hash: u64) -> Self {
+        hash
+    }
+}
+
 impl Default for Fingerprint1 {
     fn default() -> Self {
         Fingerprint1(0)
@@ -598,6 +740,18 @@ impl Default for Fingerprint2 {
     }
 }
 
+impl Default for Fingerprint24 {
+    fn default() -> Self {
+        Fingerprint24(0)
+    }
+}
+
+impl Default for Fingerprint40 {
+    fn default() -> Self {
+        Fingerprint40(0)
+    }
+}
+
 impl BitXor for Fingerprint2 {
     type Output = Self;
 
@@ -614,12 +768,62 @@ impl BitXorAssign for Fingerprint2 {
     }
 }
 
+impl BitXor for Fingerprint24 {
+    type Output = Self;
+
+    #[inline]
+    fn bitxor(self, rhs: Self) -> Self::Output {
+        Fingerprint24(self.mask() ^ rhs.mask())
+    }
+}
+
+impl BitXorAssign for Fingerprint24 {
+    #[inline]
+    fn bitxor_assign(&mut self, rhs: Self) {
+        *self = *self ^ rhs;
+    }
+}
+
+impl BitXor for Fingerprint40 {
+    type Output = Self;
+
+    #[inline]
+    fn bitxor(self, rhs: Self) -> Self::Output {
+        Fingerprint40(self.mask() ^ rhs.mask())
+    }
+}
+
+impl BitXorAssign for Fingerprint40 {
+    #[inline]
+    fn bitxor_assign(&mut self, rhs: Self) {
+        *self = *self ^ rhs;
+    }
+}
+
 impl FingerprintValue for Fingerprint2 {
     type Storage = PackedFingerprintStorage2;
 
     #[inline]
     fn from_hash(hash: u64) -> Self {
         Fingerprint2((hash as u8) & 0x03)
+    }
+}
+
+impl FingerprintValue for Fingerprint24 {
+    type Storage = PackedFingerprintStorage24;
+
+    #[inline]
+    fn from_hash(hash: u64) -> Self {
+        Fingerprint24((hash as u32) & 0x00FF_FFFF)
+    }
+}
+
+impl FingerprintValue for Fingerprint40 {
+    type Storage = PackedFingerprintStorage40;
+
+    #[inline]
+    fn from_hash(hash: u64) -> Self {
+        Fingerprint40(hash & 0xFFFF_FFFFFF)
     }
 }
 
@@ -650,12 +854,36 @@ where
             });
         }
 
-        Ok(Self::build_with_seed(
-            keys,
-            config.seed,
-            config.num_hashes,
-            layout,
-        ))
+        let mut best_build =
+            Self::build_with_seed(keys, config.seed, config.num_hashes, layout, config.tie_scan);
+        let mut best_abandoned = best_build.abandoned_keys.len();
+        if best_abandoned == 0 || MAX_BEST_EFFORT_ATTEMPTS <= 1 {
+            return Ok(best_build);
+        }
+
+        let mut attempt_seed = config.seed;
+        for _ in 1..MAX_BEST_EFFORT_ATTEMPTS {
+            attempt_seed = splitmix64(attempt_seed);
+            let candidate =
+                Self::build_with_seed(keys, attempt_seed, config.num_hashes, layout, config.tie_scan);
+            let abandoned = candidate.abandoned_keys.len();
+            if abandoned < best_abandoned {
+                best_abandoned = abandoned;
+                best_build = candidate;
+                if best_abandoned == 0 {
+                    break;
+                }
+            }
+        }
+
+        Ok(best_build)
+    }
+
+    pub fn build_generic_with_config(
+        keys: &[u64],
+        config: &FilterConfig,
+    ) -> Result<BuildOutput<F>, BuildError> {
+        Self::build_internal(keys, config)
     }
 
     /// Returns true when `key` is (probably) in the set.
@@ -687,13 +915,14 @@ where
         seed: u64,
         num_hashes: usize,
         layout: Layout,
+        tie_scan: usize,
     ) -> BuildOutput<F> {
         let array_len = layout.array_length;
         let mut degrees = vec![0u32; array_len];
         let mut idx_buf = [0usize; MAX_HASHES];
         let mut hashes = Vec::with_capacity(keys.len());
         let mut active = vec![true; keys.len()];
-        let free_inserted = 0usize;
+        let mut free_inserted = 0usize;
 
         for &key in keys {
             let hash = mixsplit(key, seed);
@@ -731,8 +960,6 @@ where
         let mut queue = Vec::with_capacity(array_len);
         let mut multi_heap: BinaryHeap<(Reverse<u32>, usize)> = BinaryHeap::with_capacity(array_len);
         let mut abandoned_keys = Vec::new();
-        let mut tmp_idx_buf = [0usize; MAX_HASHES];
-
         for i in 0..array_len {
             match degrees[i] {
                 1 => queue.push(i),
@@ -747,66 +974,6 @@ where
             indexes.iter().map(|&index| degrees[index] as u64).sum()
         };
 
-        let cell_group_stats =
-            |active: &[bool], cell: usize| -> (usize, usize) {
-                let start = adjacency_offsets[cell];
-                let end = adjacency_offsets[cell + 1];
-                let mut counts: Vec<(F, usize)> = Vec::new();
-                let mut total_active = 0usize;
-                for pos in start..end {
-                    let key_idx = adjacency[pos] as usize;
-                    if !active[key_idx] {
-                        continue;
-                    }
-                    total_active += 1;
-                    let fp = F::from_hash(hashes[key_idx]);
-                    if let Some((_, c)) = counts.iter_mut().find(|(f, _)| *f == fp) {
-                        *c += 1;
-                    } else {
-                        counts.push((fp, 1));
-                    }
-                }
-                let best = counts.into_iter().map(|(_, c)| c).max().unwrap_or(0);
-                (best, total_active)
-            };
-
-        let drop_equivalent_keys = |key_idx: usize,
-                                    cell: usize,
-                                    degrees: &mut [u32],
-                                    active: &mut [bool],
-                                    abandoned: &mut Vec<u64>,
-                                    queue: &mut Vec<usize>,
-                                    multi_heap: &mut BinaryHeap<(Reverse<u32>, usize)>,
-                                    idx_buf: &mut [usize; MAX_HASHES],
-                                    tmp_buf: &mut [usize; MAX_HASHES]| {
-            let chosen_indexes =
-                fill_indexes(hashes[key_idx], num_hashes, layout, idx_buf).to_vec();
-            let start = adjacency_offsets[cell];
-            let end = adjacency_offsets[cell + 1];
-            for pos in start..end {
-                let other_key = adjacency[pos] as usize;
-                if other_key == key_idx || !active[other_key] {
-                    continue;
-                }
-                let other_indexes = fill_indexes(hashes[other_key], num_hashes, layout, tmp_buf);
-                if other_indexes == chosen_indexes.as_slice() {
-                    active[other_key] = false;
-                    abandoned.push(keys[other_key]);
-                    for &index in other_indexes {
-                        if degrees[index] == 0 {
-                            continue;
-                        }
-                        degrees[index] -= 1;
-                        if degrees[index] == 1 {
-                            queue.push(index);
-                        } else if degrees[index] > 1 {
-                            multi_heap.push((Reverse(degrees[index]), index));
-                        }
-                    }
-                }
-            }
-        };
-
         while stack.len() + abandoned_keys.len() < keys.len() {
             let mut progress = false;
 
@@ -818,41 +985,18 @@ where
                 let start = adjacency_offsets[cell];
                 let end = adjacency_offsets[cell + 1];
                 let mut found_key = None;
-                let mut fp_counts: Vec<(F, usize, usize)> = Vec::new();
                 for pos in start..end {
                     let key_idx = adjacency[pos] as usize;
-                    if !active[key_idx] {
-                        continue;
+                    if active[key_idx] {
+                        found_key = Some(key_idx);
+                        break;
                     }
-                    let fp = F::from_hash(hashes[key_idx]);
-                    if let Some((_, count, _)) = fp_counts.iter_mut().find(|(f, _, _)| *f == fp) {
-                        *count += 1;
-                    } else {
-                        fp_counts.push((fp, 1, key_idx));
-                    }
-                }
-
-                if let Some((_, _, key_idx)) =
-                    fp_counts.into_iter().max_by_key(|(_, count, _)| *count)
-                {
-                    found_key = Some(key_idx);
                 }
 
                 if let Some(key_idx) = found_key {
                     progress = true;
                     active[key_idx] = false;
                     stack.push((cell, key_idx));
-                    drop_equivalent_keys(
-                        key_idx,
-                        cell,
-                        &mut degrees,
-                        &mut active,
-                        &mut abandoned_keys,
-                        &mut queue,
-                        &mut multi_heap,
-                        &mut idx_buf,
-                        &mut tmp_idx_buf,
-                    );
 
                     let indexes = fill_indexes(hashes[key_idx], num_hashes, layout, &mut idx_buf);
                     for &index in indexes {
@@ -879,9 +1023,7 @@ where
                 continue;
             }
 
-            // No degree-1 cells available, abandon a key from a multi-degree cell. Prefer the cell
-            // that would abandon the fewest keys (grouping identical fingerprints), scanning a
-            // limited number of ties to avoid excessive work.
+            // No degree-1 cells available, abandon a key from a multi-degree cell.
             let candidate = loop {
                 let Some((Reverse(recorded_deg), cell)) = multi_heap.pop() else {
                     break None;
@@ -890,18 +1032,50 @@ where
                 if current_deg <= 1 || current_deg != recorded_deg {
                     continue;
                 }
-
-                let (mut best_cov, total_active) = cell_group_stats(&active, cell);
-                if best_cov == 0 {
-                    degrees[cell] = 0;
-                    continue;
-                }
                 let mut best_cell = cell;
-                let mut best_abandon = total_active.saturating_sub(best_cov);
-                let mut scanned = 1usize;
+                let mut best_min_weight = u64::MAX;
                 let mut scanned_cells = Vec::new();
+                let mut scanned = 0usize;
 
-                while scanned < MAX_TIE_SCAN {
+                let min_weight_for_cell = |cell: usize,
+                                           active: &[bool],
+                                           degrees: &[u32],
+                                           idx_buf: &mut [usize; MAX_HASHES]|
+                 -> Option<u64> {
+                    let start = adjacency_offsets[cell];
+                    let end = adjacency_offsets[cell + 1];
+                    let mut min_weight = u64::MAX;
+                    for pos in start..end {
+                        let key_idx = adjacency[pos] as usize;
+                        if !active[key_idx] {
+                            continue;
+                        }
+                        let weight = key_weight(degrees, key_idx, idx_buf);
+                        if weight < min_weight {
+                            min_weight = weight;
+                        }
+                    }
+                    if min_weight == u64::MAX {
+                        None
+                    } else {
+                        Some(min_weight)
+                    }
+                };
+
+                if let Some(min_weight) =
+                    min_weight_for_cell(cell, &active, &degrees, &mut idx_buf)
+                {
+                    if min_weight < best_min_weight {
+                        best_min_weight = min_weight;
+                    } else {
+                        scanned_cells.push((Reverse(recorded_deg), cell));
+                    }
+                    scanned += 1;
+                } else {
+                    degrees[cell] = 0;
+                }
+
+                while scanned < tie_scan {
                     let Some(&(Reverse(next_deg), _)) = multi_heap.peek() else {
                         break;
                     };
@@ -913,20 +1087,19 @@ where
                     if current_deg <= 1 || current_deg != recorded_deg {
                         continue;
                     }
-                    scanned += 1;
-                    let (coverage, active_total) = cell_group_stats(&active, other_cell);
-                    if coverage == 0 {
-                        degrees[other_cell] = 0;
-                        continue;
-                    }
-                    let abandon = active_total.saturating_sub(coverage);
-                    if abandon < best_abandon || (abandon == best_abandon && coverage > best_cov) {
-                        scanned_cells.push((Reverse(recorded_deg), best_cell));
-                        best_cell = other_cell;
-                        best_abandon = abandon;
-                        best_cov = coverage;
+                    if let Some(min_weight) =
+                        min_weight_for_cell(other_cell, &active, &degrees, &mut idx_buf)
+                    {
+                        if min_weight < best_min_weight {
+                            scanned_cells.push((Reverse(recorded_deg), best_cell));
+                            best_cell = other_cell;
+                            best_min_weight = min_weight;
+                        } else {
+                            scanned_cells.push((Reverse(recorded_deg), other_cell));
+                        }
+                        scanned += 1;
                     } else {
-                        scanned_cells.push((Reverse(recorded_deg), other_cell));
+                        degrees[other_cell] = 0;
                     }
                 }
 
@@ -934,11 +1107,32 @@ where
                     multi_heap.push(cell);
                 }
 
+                if best_min_weight == u64::MAX {
+                    continue;
+                }
+
                 break Some(best_cell);
             };
 
             let Some(cell) = candidate else {
-                break;
+                let Some((abandon_key, _)) = active.iter().enumerate().find(|(_, &a)| a) else {
+                    break;
+                };
+                active[abandon_key] = false;
+                abandoned_keys.push(keys[abandon_key]);
+                let indexes = fill_indexes(hashes[abandon_key], num_hashes, layout, &mut idx_buf);
+                for &index in indexes {
+                    if degrees[index] == 0 {
+                        continue;
+                    }
+                    degrees[index] -= 1;
+                    if degrees[index] == 1 {
+                        queue.push(index);
+                    } else if degrees[index] > 1 {
+                        multi_heap.push((Reverse(degrees[index]), index));
+                    }
+                }
+                continue;
             };
 
             let start = adjacency_offsets[cell];
@@ -956,40 +1150,21 @@ where
                 continue;
             }
 
-            // Place the "lightest" key (touching the lowest-degree cells), abandon the others.
-            let mut keep_key = candidates[0];
-            let mut best_weight = key_weight(&degrees, keep_key, &mut idx_buf);
-            let mut best_coverage = 0usize;
-            for &candidate in &candidates {
+            // Abandon a single key to break the cycle, preferring the lightest key to leave
+            // heavier constraints that can drive new degree-1 cells.
+            let mut abandon_key = candidates[0];
+            let mut best_weight = key_weight(&degrees, abandon_key, &mut idx_buf);
+            for &candidate in &candidates[1..] {
                 let weight = key_weight(&degrees, candidate, &mut idx_buf);
-                let fp = F::from_hash(hashes[candidate]);
-                let mut coverage = 0usize;
-                for &other in &candidates {
-                    if active[other] && F::from_hash(hashes[other]) == fp {
-                        coverage += 1;
-                    }
-                }
-                if coverage > best_coverage || (coverage == best_coverage && weight < best_weight) {
-                    best_coverage = coverage;
+                if weight < best_weight {
                     best_weight = weight;
-                    keep_key = candidate;
+                    abandon_key = candidate;
                 }
             }
 
-            active[keep_key] = false;
-            stack.push((cell, keep_key));
-            drop_equivalent_keys(
-                keep_key,
-                cell,
-                &mut degrees,
-                &mut active,
-                &mut abandoned_keys,
-                &mut queue,
-                &mut multi_heap,
-                &mut idx_buf,
-                &mut tmp_idx_buf,
-            );
-            let indexes = fill_indexes(hashes[keep_key], num_hashes, layout, &mut idx_buf);
+            active[abandon_key] = false;
+            abandoned_keys.push(keys[abandon_key]);
+            let indexes = fill_indexes(hashes[abandon_key], num_hashes, layout, &mut idx_buf);
             for &index in indexes {
                 if degrees[index] == 0 {
                     continue;
@@ -1002,27 +1177,7 @@ where
                 }
             }
 
-            for &abandon_key in &candidates[1..] {
-                if !active[abandon_key] {
-                    continue;
-                }
-                active[abandon_key] = false;
-                abandoned_keys.push(keys[abandon_key]);
-
-                let indexes =
-                    fill_indexes(hashes[abandon_key], num_hashes, layout, &mut idx_buf);
-                for &index in indexes {
-                    if degrees[index] == 0 {
-                        continue;
-                    }
-                    degrees[index] -= 1;
-                    if degrees[index] == 1 {
-                        queue.push(index);
-                    } else if degrees[index] > 1 {
-                        multi_heap.push((Reverse(degrees[index]), index));
-                    }
-                }
-                }
+            // Keep remaining candidates active; cycle breaking only removes the chosen key.
         }
 
         for (key_idx, is_active) in active.iter_mut().enumerate() {
@@ -1045,13 +1200,33 @@ where
             fingerprints.set(cell, value);
         }
 
+        let filter = Self {
+            seed,
+            num_hashes,
+            layout,
+            fingerprints,
+        };
+        if !keys.is_empty() {
+            if !abandoned_keys.is_empty() {
+                abandoned_keys.sort_unstable();
+                abandoned_keys.dedup();
+                for &key in &abandoned_keys {
+                    if filter.contains(key) {
+                        free_inserted += 1;
+                    }
+                }
+            }
+            let mut missed_keys = Vec::new();
+            for &key in keys {
+                if !filter.contains(key) {
+                    missed_keys.push(key);
+                }
+            }
+            abandoned_keys = missed_keys;
+        }
+
         BuildOutput {
-            filter: Self {
-                seed,
-                num_hashes,
-                layout,
-                fingerprints,
-            },
+            filter,
             abandoned_keys,
             total_slots: layout.array_length,
             empty_slots,
@@ -1274,9 +1449,23 @@ impl<F> BinaryFuseFilter<F>
 where
     F: FingerprintValue,
 {
-    fn build_lossless_with_config(
+    pub fn build_lossless_with_config(
         keys: &[u64],
         config: &FilterConfig,
+    ) -> Result<BuildOutput<F>, BuildError> {
+        Self::build_lossless_with_config_internal(
+            keys,
+            config,
+            false,
+            MAX_LOSSLESS_FIXED_ATTEMPTS,
+        )
+    }
+
+    fn build_lossless_with_config_internal(
+        keys: &[u64],
+        config: &FilterConfig,
+        grow_overhead: bool,
+        max_attempts: usize,
     ) -> Result<BuildOutput<F>, BuildError> {
         validate_config(config)?;
 
@@ -1298,26 +1487,28 @@ where
         }
 
         let mut attempt_seed = config.seed;
-        let mut overhead = config.overhead.max(1.1);
+        let mut overhead = config.overhead.max(1.3);
 
-        for attempt in 0..MAX_BINARY_FUSE_ATTEMPTS {
+        for attempt in 0..max_attempts {
             if attempt > 0 {
-                overhead *= 1.1;
+                if grow_overhead {
+                    overhead *= 1.01;
+                }
                 attempt_seed = splitmix64(attempt_seed);
             }
             let attempt_config = FilterConfig {
                 overhead,
                 num_hashes: config.num_hashes,
+                tie_scan: config.tie_scan,
                 seed: attempt_seed,
             };
             let layout = calculate_layout(keys.len(), &attempt_config)?;
-            let build = BinaryFuseFilter::build_with_seed(
+            if let Ok(build) = Self::build_with_seed_lossless(
                 keys,
                 attempt_config.seed,
                 attempt_config.num_hashes,
                 layout,
-            );
-            if build.abandoned_keys.is_empty() {
+            ) {
                 return Ok(build);
             }
         }
@@ -1325,6 +1516,131 @@ where
         Err(BuildError::ConstructionFailed(
             "binary fuse remainder failed to build without abandoned keys",
         ))
+    }
+
+    fn build_with_seed_lossless(
+        keys: &[u64],
+        seed: u64,
+        num_hashes: usize,
+        layout: Layout,
+    ) -> Result<BuildOutput<F>, BuildError> {
+        let array_len = layout.array_length;
+        let mut degrees = vec![0u32; array_len];
+        let mut idx_buf = [0usize; MAX_HASHES];
+        let mut hashes = Vec::with_capacity(keys.len());
+
+        for &key in keys {
+            let hash = mixsplit(key, seed);
+            hashes.push(hash);
+            let indexes = fill_indexes(hash, num_hashes, layout, &mut idx_buf);
+            for &i in indexes {
+                degrees[i] = degrees[i].saturating_add(1);
+            }
+        }
+
+        let empty_slots = degrees.iter().filter(|&&d| d == 0).count();
+
+        let mut adjacency_offsets = vec![0usize; array_len + 1];
+        let mut total_edges = 0usize;
+        for (slot, &degree) in degrees.iter().enumerate() {
+            adjacency_offsets[slot] = total_edges;
+            total_edges += degree as usize;
+        }
+        adjacency_offsets[array_len] = total_edges;
+
+        let mut adjacency = vec![0u32; total_edges];
+        {
+            let mut next_offset = adjacency_offsets[..array_len].to_vec();
+            for (key_idx, &hash) in hashes.iter().enumerate() {
+                let indexes = fill_indexes(hash, num_hashes, layout, &mut idx_buf);
+                for &index in indexes {
+                    let pos = next_offset[index];
+                    adjacency[pos] = key_idx as u32;
+                    next_offset[index] += 1;
+                }
+            }
+        }
+
+        let mut stack = Vec::with_capacity(keys.len());
+        let mut queue = Vec::with_capacity(array_len);
+        let mut active = vec![true; keys.len()];
+
+        for i in 0..array_len {
+            if degrees[i] == 1 {
+                queue.push(i);
+            }
+        }
+
+        while let Some(cell) = queue.pop() {
+            if degrees[cell] != 1 {
+                continue;
+            }
+
+            let start = adjacency_offsets[cell];
+            let end = adjacency_offsets[cell + 1];
+            let mut key_idx = None;
+            for pos in start..end {
+                let idx = adjacency[pos] as usize;
+                if active[idx] {
+                    key_idx = Some(idx);
+                    break;
+                }
+            }
+            let Some(key_idx) = key_idx else {
+                degrees[cell] = 0;
+                continue;
+            };
+
+            active[key_idx] = false;
+            stack.push((cell, key_idx));
+            let indexes = fill_indexes(hashes[key_idx], num_hashes, layout, &mut idx_buf);
+            for &index in indexes {
+                if degrees[index] == 0 {
+                    continue;
+                }
+                degrees[index] -= 1;
+                if degrees[index] == 1 {
+                    queue.push(index);
+                }
+            }
+        }
+
+        if stack.len() != keys.len() {
+            return Err(BuildError::ConstructionFailed(
+                "binary fuse build failed without abandoned keys",
+            ));
+        }
+
+        let mut fingerprints = F::Storage::new(array_len);
+        while let Some((cell, key_idx)) = stack.pop() {
+            let hash = hashes[key_idx];
+            let indexes = fill_indexes(hash, num_hashes, layout, &mut idx_buf);
+            let mut value = F::from_hash(hash);
+            for &index in indexes {
+                if index != cell {
+                    value ^= fingerprints.get(index);
+                }
+            }
+            fingerprints.set(cell, value);
+        }
+
+        Ok(BuildOutput {
+            filter: Self {
+                seed,
+                num_hashes,
+                layout,
+                fingerprints,
+            },
+            abandoned_keys: Vec::new(),
+            total_slots: array_len,
+            empty_slots,
+            actual_overhead: if keys.is_empty() {
+                0.0
+            } else {
+                array_len as f64 / keys.len() as f64
+            },
+            free_inserted_keys: 0,
+        })
     }
 }
 
@@ -1368,12 +1684,15 @@ where
     } else {
         let adjusted_remainder_config = FilterConfig {
             overhead: config.remainder.overhead.max(1.1),
+            tie_scan: config.remainder.tie_scan,
             ..config.remainder
         };
         let remainder_start = Instant::now();
-        let remainder_build = BinaryFuseFilter::<RemFp>::build_lossless_with_config(
+        let remainder_build = BinaryFuseFilter::<RemFp>::build_lossless_with_config_internal(
             &remainder_candidates,
             &adjusted_remainder_config,
+            true,
+            MAX_BINARY_FUSE_ATTEMPTS,
         )?;
         remainder_build_time = remainder_start.elapsed();
 
@@ -1633,6 +1952,11 @@ fn validate_config(config: &FilterConfig) -> Result<(), BuildError> {
             "overhead must be greater than 0.0",
         ));
     }
+    if config.tie_scan == 0 {
+        return Err(BuildError::InvalidConfig(
+            "tie_scan must be greater than 0",
+        ));
+    }
     Ok(())
 }
 
@@ -1653,10 +1977,7 @@ fn calculate_layout(key_count: usize, config: &FilterConfig) -> Result<Layout, B
             break;
         }
     }
-    let capacity = target_slots
-        .saturating_add(segment_length)
-        .max(target_slots);
-    let mut total_segments = (capacity + segment_length - 1) / segment_length;
+    let mut total_segments = (target_slots + segment_length - 1) / segment_length;
     if total_segments < num_hashes {
         total_segments = num_hashes;
     }
@@ -1683,8 +2004,11 @@ fn calculate_layout(key_count: usize, config: &FilterConfig) -> Result<Layout, B
 fn segment_length_for(num_hashes: usize, key_count: usize) -> usize {
     let size = cmp::max(key_count, 1) as f64;
     let log_size = size.ln();
-    let base = (2.91 - 0.22 * (num_hashes as f64 - 4.0)).max(1.8);
-    let offset = (-0.5 - 0.1 * (num_hashes as f64 - 4.0)).max(-3.5);
+    let (base, offset) = if num_hashes <= 3 {
+        (3.33_f64, 2.25_f64)
+    } else {
+        (2.91_f64, -0.5_f64)
+    };
     let shift = (log_size / base.ln() + offset).floor() as i32;
     let clamped = shift.clamp(1, MAX_SEGMENT_LENGTH_LOG as i32);
     1usize << clamped
@@ -1700,14 +2024,14 @@ fn fill_indexes<'a>(
         return &[];
     }
 
-    let total_segments = (layout.segment_count + num_hashes - 1) as u64;
-    let base_segment = (((hash as u128) * (total_segments as u128)) >> 64) as u64;
+    let segment_count = layout.segment_count as u64;
+    let base_segment = (((hash as u128) * (segment_count as u128)) >> 64) as u64;
     let segment_length = layout.segment_length as u64;
     let mask = layout.segment_length_mask as u64;
 
     let mut h = hash;
     for (i, slot) in out.iter_mut().take(num_hashes).enumerate() {
-        let segment = (base_segment + i as u64) % total_segments;
+        let segment = base_segment + i as u64;
         let offset = segment * segment_length;
         let variation = h & mask;
         let index = offset + variation;
@@ -1738,9 +2062,13 @@ mod tests {
     #[test]
     fn deterministic_membership() {
         let keys: Vec<u64> = (0..10_000).map(|i| i as u64 * 13_791).collect();
-        let build =
-            BinaryFuseFilter::<u8>::build_lossless_with_config(&keys, &FilterConfig::default())
-                .expect("filter should build");
+        let build = BinaryFuseFilter::<u8>::build_lossless_with_config_internal(
+            &keys,
+            &FilterConfig::default(),
+            true,
+            MAX_BINARY_FUSE_ATTEMPTS,
+        )
+        .expect("filter should build");
         let abandoned: HashSet<u64> = build.abandoned_keys.iter().copied().collect();
         assert!(abandoned.is_empty(), "lossless build should not abandon keys");
         let filter = build.filter;
@@ -1779,6 +2107,7 @@ mod tests {
         let config = FilterConfig {
             overhead: 1.35,
             num_hashes: 4,
+            tie_scan: 8,
             seed: 42,
         };
         let build =
@@ -1880,6 +2209,7 @@ mod tests {
         let config = FilterConfig {
             overhead: 1.5,
             num_hashes: 7,
+            tie_scan: 8,
             seed: 123,
         };
         let build =
@@ -1935,10 +2265,16 @@ mod tests {
         let config = FilterConfig {
             overhead: 1.0,
             num_hashes: 8,
+            tie_scan: 8,
             seed: 123,
         };
-        let build = BinaryFuseFilter::<u16>::build_lossless_with_config(&keys, &config)
-            .expect("lossless remainder");
+        let build = BinaryFuseFilter::<u16>::build_lossless_with_config_internal(
+            &keys,
+            &config,
+            true,
+            MAX_BINARY_FUSE_ATTEMPTS,
+        )
+        .expect("lossless remainder");
         let min_slots = ((keys.len() as f64) * 1.1).ceil() as usize;
         assert!(
             build.total_slots >= min_slots,

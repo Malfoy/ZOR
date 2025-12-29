@@ -1,6 +1,5 @@
 use std::env;
 use std::io::{self, Write};
-use std::mem;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -12,8 +11,84 @@ mod fuse_filter;
 use fuse_filter::{FuseFilter, FuseFilterConfig};
 use zor_filter::{
     BinaryFuseFilter, BuildOutput, FilterConfig, Fingerprint1, Fingerprint2, Fingerprint4,
-    FingerprintValue,
+    Fingerprint24, Fingerprint40, FingerprintValue,
 };
+
+trait AuxFingerprintAdd<const ADD_BYTES: usize> {
+    type Aux: FingerprintValue;
+}
+
+macro_rules! impl_aux_add {
+    ($add:expr, $fp_small:ty, $u8_ty:ty, $u16_ty:ty, $u32_ty:ty, $u64_ty:ty) => {
+        impl AuxFingerprintAdd<$add> for Fingerprint1 {
+            type Aux = $fp_small;
+        }
+
+        impl AuxFingerprintAdd<$add> for Fingerprint2 {
+            type Aux = $fp_small;
+        }
+
+        impl AuxFingerprintAdd<$add> for Fingerprint4 {
+            type Aux = $fp_small;
+        }
+
+        impl AuxFingerprintAdd<$add> for u8 {
+            type Aux = $u8_ty;
+        }
+
+        impl AuxFingerprintAdd<$add> for u16 {
+            type Aux = $u16_ty;
+        }
+
+        impl AuxFingerprintAdd<$add> for u32 {
+            type Aux = $u32_ty;
+        }
+
+        impl AuxFingerprintAdd<$add> for u64 {
+            type Aux = $u64_ty;
+        }
+    };
+}
+
+impl_aux_add!(0, u8, u8, u16, u32, u64);
+impl_aux_add!(1, u16, u16, Fingerprint24, Fingerprint40, u64);
+impl_aux_add!(2, Fingerprint24, Fingerprint24, u32, u64, u64);
+impl_aux_add!(3, u32, u32, Fingerprint40, u64, u64);
+impl_aux_add!(4, Fingerprint40, Fingerprint40, u64, u64, u64);
+
+impl AuxFingerprintAdd<0> for Fingerprint24 {
+    type Aux = Fingerprint24;
+}
+impl AuxFingerprintAdd<1> for Fingerprint24 {
+    type Aux = u32;
+}
+impl AuxFingerprintAdd<2> for Fingerprint24 {
+    type Aux = Fingerprint40;
+}
+impl AuxFingerprintAdd<3> for Fingerprint24 {
+    type Aux = u64;
+}
+impl AuxFingerprintAdd<4> for Fingerprint24 {
+    type Aux = u64;
+}
+
+impl AuxFingerprintAdd<0> for Fingerprint40 {
+    type Aux = Fingerprint40;
+}
+impl AuxFingerprintAdd<1> for Fingerprint40 {
+    type Aux = u64;
+}
+impl AuxFingerprintAdd<2> for Fingerprint40 {
+    type Aux = u64;
+}
+impl AuxFingerprintAdd<3> for Fingerprint40 {
+    type Aux = u64;
+}
+impl AuxFingerprintAdd<4> for Fingerprint40 {
+    type Aux = u64;
+}
+
+type AuxOf<F, const ADD_BYTES: usize> = <F as AuxFingerprintAdd<ADD_BYTES>>::Aux;
 
 fn main() {
     let cli = Cli::from_env();
@@ -26,40 +101,67 @@ fn main() {
     }
 }
 
-fn run_benchmark(cli: &Cli, num_hashes: usize) {
-    println!(
-        "running {} iterations with key_count={}, query_count={}, overhead={}, num_hashes={}, threads={}",
-        cli.runs, cli.key_count, cli.query_count, cli.overhead, num_hashes, cli.threads
-    );
-
-    run_benchmark_for_fp::<Fingerprint1, _>(cli, num_hashes, "1-bit", 1.0, |keys, cfg| {
-        BinaryFuseFilter::build_1_with_config(keys, cfg).expect("1-bit filter should build")
-    });
-    run_benchmark_for_fp::<Fingerprint2, _>(cli, num_hashes, "2-bit", 2.0, |keys, cfg| {
-        BinaryFuseFilter::build_2_with_config(keys, cfg).expect("2-bit filter should build")
-    });
-    run_benchmark_for_fp::<Fingerprint4, _>(cli, num_hashes, "4-bit", 4.0, |keys, cfg| {
-        BinaryFuseFilter::build_4_with_config(keys, cfg).expect("4-bit filter should build")
-    });
-    run_benchmark_for_fp::<u8, _>(cli, num_hashes, "8-bit", 8.0, |keys, cfg| {
-        BinaryFuseFilter::build_8_with_config(keys, cfg).expect("8-bit filter should build")
-    });
-    run_benchmark_for_fp::<u16, _>(cli, num_hashes, "16-bit", 16.0, |keys, cfg| {
-        BinaryFuseFilter::build_16_with_config(keys, cfg).expect("16-bit filter should build")
-    });
-    run_benchmark_for_fp::<u32, _>(cli, num_hashes, "32-bit", 32.0, |keys, cfg| {
-        BinaryFuseFilter::build_32_with_config(keys, cfg).expect("32-bit filter should build")
-    });
+macro_rules! run_benchmark_set {
+    ($add:expr, $cli:expr, $num_hashes:expr) => {{
+        run_benchmark_for_fp::<u8, $add, _>($cli, $num_hashes, "8-bit", 8.0, |keys, cfg| {
+            BinaryFuseFilter::build_8_with_config(keys, cfg).expect("8-bit filter should build")
+        });
+        run_benchmark_for_fp::<u16, $add, _>($cli, $num_hashes, "16-bit", 16.0, |keys, cfg| {
+            BinaryFuseFilter::build_16_with_config(keys, cfg).expect("16-bit filter should build")
+        });
+        run_benchmark_for_fp::<Fingerprint24, $add, _>(
+            $cli,
+            $num_hashes,
+            "24-bit",
+            24.0,
+            |keys, cfg| {
+                BinaryFuseFilter::<Fingerprint24>::build_generic_with_config(keys, cfg)
+                    .expect("24-bit filter should build")
+            },
+        );
+        run_benchmark_for_fp::<u32, $add, _>($cli, $num_hashes, "32-bit", 32.0, |keys, cfg| {
+            BinaryFuseFilter::build_32_with_config(keys, cfg).expect("32-bit filter should build")
+        });
+    }};
 }
 
-fn run_benchmark_for_fp<F, BuildFn>(
+fn run_benchmark(cli: &Cli, num_hashes: usize) {
+    println!(
+        "running {} iterations with key_count={}, query_count={}, overhead={}, num_hashes={}, threads={}, cascade={}, aux_add_bytes={}, tie_scan={}",
+        cli.runs,
+        cli.key_count,
+        cli.query_count,
+        cli.overhead,
+        num_hashes,
+        cli.threads,
+        cli.cascade,
+        cli.aux_add_bytes,
+        cli.tie_scan
+    );
+
+    match cli.aux_add_bytes {
+        0 => run_benchmark_set!(0, cli, num_hashes),
+        1 => run_benchmark_set!(1, cli, num_hashes),
+        2 => run_benchmark_set!(2, cli, num_hashes),
+        3 => run_benchmark_set!(3, cli, num_hashes),
+        4 => run_benchmark_set!(4, cli, num_hashes),
+        other => {
+            eprintln!(
+                "aux_add_bytes={other} unsupported, clamping to 4 (u64 aux fingerprints)"
+            );
+            run_benchmark_set!(4, cli, num_hashes);
+        }
+    }
+}
+
+fn run_benchmark_for_fp<F, const ADD_BYTES: usize, BuildFn>(
     cli: &Cli,
     num_hashes: usize,
     label: &'static str,
     fingerprint_bits: f64,
     builder: BuildFn,
 ) where
-    F: FingerprintValue + Send + Sync + 'static,
+    F: FingerprintValue + AuxFingerprintAdd<ADD_BYTES> + Send + Sync + 'static,
     BuildFn: Fn(&[u64], &FilterConfig) -> BuildOutput<F> + Send + Sync + 'static,
 {
     println!("--- fingerprint={label} ---");
@@ -67,6 +169,7 @@ fn run_benchmark_for_fp<F, BuildFn>(
     let config = FilterConfig {
         overhead: cli.overhead,
         num_hashes,
+        tie_scan: cli.tie_scan,
         seed: cli.seed,
     };
 
@@ -111,6 +214,7 @@ fn run_benchmark_for_fp<F, BuildFn>(
         let key_count = key_count;
         let query_count = query_count;
         let aux_overhead = cli.aux_overhead;
+        let cascade = cli.cascade;
 
         let handle = thread::spawn(move || loop {
             let run = counter.fetch_add(1, Ordering::Relaxed);
@@ -142,23 +246,77 @@ fn run_benchmark_for_fp<F, BuildFn>(
 
             let mut aux_bytes = 0u64;
             let mut aux_slots = 0u64;
-            let mut aux_filter = None;
-            if !missed_keys.is_empty() {
-                let aux_build = FuseFilter::build(
-                    &missed_keys,
+            let mut secondary_filter: Option<BinaryFuseFilter<AuxOf<F, ADD_BYTES>>> = None;
+            let mut aux_filter: Option<FuseFilter<AuxOf<F, ADD_BYTES>>> = None;
+            if cascade {
+                if !missed_keys.is_empty() {
+                    let secondary_build =
+                        BinaryFuseFilter::<AuxOf<F, ADD_BYTES>>::build_generic_with_config(
+                            &missed_keys,
+                            &config,
+                        )
+                        .expect("secondary filter should build");
+                    aux_slots = aux_slots.saturating_add(secondary_build.total_slots as u64);
+                    aux_bytes = aux_bytes.saturating_add(
+                        secondary_build.filter.fingerprint_bytes() as u64,
+                    );
+                    secondary_filter = Some(secondary_build.filter);
+
+                    if !secondary_build.abandoned_keys.is_empty() {
+                        let aux_build = FuseFilter::<AuxOf<F, ADD_BYTES>>::build(
+                            &secondary_build.abandoned_keys,
+                            &FuseFilterConfig {
+                                overhead: aux_overhead,
+                                seed: derive_seed(
+                                    config.seed ^ 0xDEAD_BEEF_A55A_55AA,
+                                    run as u64,
+                                    worker_id as u64,
+                                ),
+                                num_hashes,
+                            },
+                        )
+                        .expect("aux filter should build");
+                        aux_slots = aux_slots.saturating_add(aux_build.total_slots as u64);
+                        aux_bytes =
+                            aux_bytes.saturating_add(aux_build.filter.fingerprint_bytes() as u64);
+                        aux_filter = Some(aux_build.filter);
+                    }
+                }
+            } else if !build.abandoned_keys.is_empty() {
+                let aux_build = FuseFilter::<AuxOf<F, ADD_BYTES>>::build(
+                    &build.abandoned_keys,
                     &FuseFilterConfig {
                         overhead: aux_overhead,
-                        seed: derive_seed(config.seed ^ 0xDEAD_BEEF_A55A_55AA, run as u64, worker_id as u64),
+                        seed: derive_seed(
+                            config.seed ^ 0xDEAD_BEEF_A55A_55AA,
+                            run as u64,
+                            worker_id as u64,
+                        ),
+                        num_hashes,
                     },
                 )
                 .expect("aux filter should build");
                 aux_slots = aux_build.total_slots as u64;
-                aux_bytes = aux_slots * mem::size_of::<u16>() as u64;
+                aux_bytes = aux_build.filter.fingerprint_bytes() as u64;
                 aux_filter = Some(aux_build.filter);
             }
 
             let mut false_negatives = 0u64;
-            if let Some(aux) = aux_filter.as_ref() {
+            if cascade {
+                for &key in &missed_keys {
+                    if let Some(secondary) = secondary_filter.as_ref() {
+                        if secondary.contains(key) {
+                            continue;
+                        }
+                    }
+                    if let Some(aux) = aux_filter.as_ref() {
+                        if aux.contains(key) {
+                            continue;
+                        }
+                    }
+                    false_negatives += 1;
+                }
+            } else if let Some(aux) = aux_filter.as_ref() {
                 for &key in &missed_keys {
                     if !aux.contains(key) {
                         false_negatives += 1;
@@ -176,8 +334,16 @@ fn run_benchmark_for_fp<F, BuildFn>(
                 let mut query_generator = SplitMix64::new(query_seed);
                 for _ in 0..query_count {
                     let key = query_generator.next();
-                    if contains_with_aux(&filter, aux_filter.as_ref(), key)
-                        && keys.binary_search(&key).is_err()
+                    if (if cascade {
+                        contains_with_cascade(
+                            &filter,
+                            secondary_filter.as_ref(),
+                            aux_filter.as_ref(),
+                            key,
+                        )
+                    } else {
+                        contains_with_aux(&filter, aux_filter.as_ref(), key)
+                    }) && keys.binary_search(&key).is_err()
                     {
                         false_positives += 1;
                     }
@@ -389,12 +555,36 @@ fn run_benchmark_for_fp<F, BuildFn>(
     }
 }
 
-fn contains_with_aux<F: FingerprintValue>(
-    filter: &BinaryFuseFilter<F>,
-    aux: Option<&FuseFilter>,
+fn contains_with_aux<MainF, AuxF>(
+    filter: &BinaryFuseFilter<MainF>,
+    aux: Option<&FuseFilter<AuxF>>,
     key: u64,
-) -> bool {
+) -> bool
+where
+    MainF: FingerprintValue,
+    AuxF: FingerprintValue,
+{
     if filter.contains(key) {
+        return true;
+    }
+    aux.map_or(false, |filter| filter.contains(key))
+}
+
+fn contains_with_cascade<MainF, SecondaryF, AuxF>(
+    filter: &BinaryFuseFilter<MainF>,
+    secondary: Option<&BinaryFuseFilter<SecondaryF>>,
+    aux: Option<&FuseFilter<AuxF>>,
+    key: u64,
+) -> bool
+where
+    MainF: FingerprintValue,
+    SecondaryF: FingerprintValue,
+    AuxF: FingerprintValue,
+{
+    if filter.contains(key) {
+        return true;
+    }
+    if secondary.map_or(false, |filter| filter.contains(key)) {
         return true;
     }
     aux.map_or(false, |filter| filter.contains(key))
@@ -406,6 +596,9 @@ struct Cli {
     query_count: usize,
     overhead: f64,
     aux_overhead: f64,
+    aux_add_bytes: usize,
+    tie_scan: usize,
+    cascade: bool,
     hash_counts: Vec<usize>,
     runs: u32,
     seed: u64,
@@ -415,16 +608,19 @@ struct Cli {
 impl Cli {
     fn from_env() -> Self {
         let mut cli = Self {
-            key_count: 1_000_000,
+            key_count: 10_000_000,
             query_count: 10_000_000,
             overhead: 1.00,
-            aux_overhead: 1.1,
-            hash_counts: vec![ 6],
+            aux_overhead: 1.01,
+            aux_add_bytes: 1,
+            tie_scan: 8,
+            cascade: false,
+            hash_counts: vec![8],
             runs: 32,
             seed: generate_seed(),
             threads: thread::available_parallelism()
                 .map(|n| n.get())
-                .unwrap_or(32),
+                .unwrap_or(16),
         };
 
         let mut query_count_set = false;
@@ -453,6 +649,9 @@ impl Cli {
                 }
                 "--overhead" => cli.overhead = parse(args.next(), "--overhead"),
                 "--aux-overhead" => cli.aux_overhead = parse(args.next(), "--aux-overhead"),
+                "--aux-add-bytes" => cli.aux_add_bytes = parse(args.next(), "--aux-add-bytes"),
+                "--tie-scan" => cli.tie_scan = parse(args.next(), "--tie-scan"),
+                "--cascade" => cli.cascade = true,
                 "--hashes" => cli.hash_counts = parse_hashes(args.next(), "--hashes"),
                 "--runs" => cli.runs = parse(args.next(), "--runs"),
                 "--seed" => cli.seed = parse(args.next(), "--seed"),

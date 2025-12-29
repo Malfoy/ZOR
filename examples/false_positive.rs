@@ -46,12 +46,14 @@ fn main() {
     let main_config = FilterConfig {
         overhead,
         num_hashes,
+        tie_scan: 8,
         seed,
     };
     let remainder_overhead = overhead.max(1.1);
     let remainder_config = FilterConfig {
         overhead: remainder_overhead,
         num_hashes,
+        tie_scan: 8,
         seed: seed ^ 0xD6E8_FEB8_6659_FD93,
     };
     let complete_config = CompleteFilterConfig {
