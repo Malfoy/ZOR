@@ -4,9 +4,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
 
-use zor_filter::{
-    BinaryFuseFilter, CompleteFilterConfig, CycleBreakHeuristic, FilterConfig, PartitionConfig,
-};
+use zor_filter::{CycleBreakHeuristic, FilterConfig, PartitionConfig, RemainderOf, ZorFilter};
 
 fn main() {
     let key_count = 1_000_000;
@@ -15,7 +13,6 @@ fn main() {
     let keys: Vec<u64> = (0..key_count).map(|i| i as u64 * 13_791).collect();
     let key_set: Arc<HashSet<u64>> = Arc::new(keys.iter().copied().collect());
 
-    let mut overhead = 1.0;
     let mut num_hashes = 16;
     let mut seed = 0_u64;
     let mut partition_size: Option<usize> = None;
@@ -34,7 +31,6 @@ fn main() {
         }
 
         match flag.as_str() {
-            "--overhead" => overhead = parse(args.next(), "--overhead"),
             "--hashes" => num_hashes = parse(args.next(), "--hashes"),
             "--seed" => seed = parse(args.next(), "--seed"),
             "--partition-size" => partition_size = Some(parse(args.next(), "--partition-size")),
@@ -46,27 +42,14 @@ fn main() {
     }
 
     let main_config = FilterConfig {
-        overhead,
         num_hashes,
-        tie_scan: 8,
+        tie_scan: 1,
         cycle_break: CycleBreakHeuristic::MostDeg2,
         seed,
     };
-    let remainder_overhead = overhead.max(1.1);
-    let remainder_config = FilterConfig {
-        overhead: remainder_overhead,
-        num_hashes,
-        tie_scan: 8,
-        cycle_break: CycleBreakHeuristic::MostDeg2,
-        seed: seed ^ 0xD6E8_FEB8_6659_FD93,
-    };
-    let complete_config = CompleteFilterConfig {
-        main: main_config,
-        remainder: remainder_config,
-    };
 
     let build_start = Instant::now();
-    let build_8_16 = BinaryFuseFilter::build_complete_8_16_with_config(&keys, &complete_config)
+    let build_8_16 = ZorFilter::<u8>::build_with_config(&keys, &main_config)
         .expect("8/16 filter should build");
     let build_time_8_16 = build_start.elapsed();
     evaluate_variant(
@@ -81,13 +64,13 @@ fn main() {
     println!();
 
     let build_start = Instant::now();
-    let build_16_32 = BinaryFuseFilter::build_complete_16_32_with_config(&keys, &complete_config)
-        .expect("16/32 filter should build");
-    let build_time_16_32 = build_start.elapsed();
+    let build_16_24 = ZorFilter::<u16>::build_with_config(&keys, &main_config)
+        .expect("16/24 filter should build");
+    let build_time_16_24 = build_start.elapsed();
     evaluate_variant(
-        "16/32",
-        build_16_32,
-        build_time_16_32,
+        "16/24",
+        build_16_24,
+        build_time_16_24,
         &keys,
         &key_set,
         query_count,
@@ -100,7 +83,7 @@ fn main() {
         let partition_seed = seed ^ 0xA5A5_5A5A_1234_5678;
         let partition_threads = partition_threads.unwrap_or(0);
         let partition_config = PartitionConfig {
-            base: complete_config,
+            base: main_config,
             target_partition_size,
             partition_seed,
             max_threads: partition_threads,
@@ -118,7 +101,7 @@ fn main() {
 
         let build_start = Instant::now();
         let partitioned_8_16 =
-            BinaryFuseFilter::build_partitioned_8_16_with_config(&keys, &partition_config)
+            ZorFilter::<u8>::build_partitioned_with_config(&keys, &partition_config)
                 .expect("partitioned 8/16 filter should build");
         let build_time = build_start.elapsed();
         evaluate_partitioned_variant(
@@ -134,13 +117,13 @@ fn main() {
         println!();
 
         let build_start = Instant::now();
-        let partitioned_16_32 =
-            BinaryFuseFilter::build_partitioned_16_32_with_config(&keys, &partition_config)
-                .expect("partitioned 16/32 filter should build");
+        let partitioned_16_24 =
+            ZorFilter::<u16>::build_partitioned_with_config(&keys, &partition_config)
+                .expect("partitioned 16/24 filter should build");
         let build_time = build_start.elapsed();
         evaluate_partitioned_variant(
-            "16/32 partitioned",
-            partitioned_16_32,
+            "16/24 partitioned",
+            partitioned_16_24,
             build_time,
             target_partition_size,
             &keys,
@@ -150,18 +133,18 @@ fn main() {
     }
 }
 
-fn evaluate_variant<MainFp, RemFp>(
+fn evaluate_variant<MainFp>(
     label: &str,
-    build: zor_filter::CompleteBuildOutput<MainFp, RemFp>,
+    build: zor_filter::ZorBuildOutput<MainFp>,
     build_time: std::time::Duration,
     keys: &[u64],
     key_set: &Arc<HashSet<u64>>,
     query_count: usize,
 ) where
-    MainFp: zor_filter::FingerprintValue + Send + Sync + 'static,
-    RemFp: zor_filter::FingerprintValue + Send + Sync + 'static,
+    MainFp: zor_filter::FingerprintValue + zor_filter::RemainderFingerprint + Send + Sync + 'static,
+    RemainderOf<MainFp>: zor_filter::FingerprintValue + Send + Sync + 'static,
 {
-    let zor_filter::CompleteBuildOutput {
+    let zor_filter::ZorBuildOutput {
         filter,
         main_abandoned_keys,
         remainder_abandoned_keys,
@@ -178,7 +161,7 @@ fn evaluate_variant<MainFp, RemFp>(
 
     let key_count = keys.len();
     let zor_bits = std::mem::size_of::<MainFp>() * 8;
-    let remainder_bits = std::mem::size_of::<RemFp>() * 8;
+    let remainder_bits = std::mem::size_of::<RemainderOf<MainFp>>() * 8;
 
     println!("=== Variant {label} ===");
     println!("Configuration: ZOR {zor_bits} bits | remainder {remainder_bits} bits");
@@ -212,7 +195,7 @@ fn evaluate_variant<MainFp, RemFp>(
             );
         }
     } else {
-        println!("remainder filter not constructed (no abandoned keys)");
+        println!("remainder filter not constructed (no candidates or build failed)");
     }
     println!("main abandoned keys: {}", main_abandoned_keys.len());
     println!(
@@ -225,14 +208,12 @@ fn evaluate_variant<MainFp, RemFp>(
         total_bytes, bytes_per_key
     );
 
-    assert!(
-        remainder_abandoned_keys.is_empty(),
-        "remainder layer should not abandon keys"
-    );
-    assert!(
-        fallback_key_count == 0,
-        "fallback storage should remain empty when remainder succeeds"
-    );
+    if !remainder_abandoned_keys.is_empty() {
+        println!(
+            "remainder abandoned keys (stored in fallback): {}",
+            remainder_abandoned_keys.len()
+        );
+    }
 
     let filter = Arc::new(filter);
     let mut false_negatives = 0usize;
@@ -377,17 +358,17 @@ fn evaluate_variant<MainFp, RemFp>(
     }
 }
 
-fn evaluate_partitioned_variant<MainFp, RemFp>(
+fn evaluate_partitioned_variant<MainFp>(
     label: &str,
-    build: zor_filter::PartitionedBuildOutput<MainFp, RemFp>,
+    build: zor_filter::PartitionedBuildOutput<MainFp>,
     wall_clock: std::time::Duration,
     target_partition_size: usize,
     keys: &[u64],
     key_set: &Arc<HashSet<u64>>,
     query_count: usize,
 ) where
-    MainFp: zor_filter::FingerprintValue + Send + Sync + 'static,
-    RemFp: zor_filter::FingerprintValue + Send + Sync + 'static,
+    MainFp: zor_filter::FingerprintValue + zor_filter::RemainderFingerprint + Send + Sync + 'static,
+    RemainderOf<MainFp>: zor_filter::FingerprintValue + Send + Sync + 'static,
 {
     let zor_filter::PartitionedBuildOutput {
         filter,
@@ -419,7 +400,7 @@ fn evaluate_partitioned_variant<MainFp, RemFp>(
     let empty_partitions = partition_stats.iter().filter(|s| s.key_count == 0).count();
 
     println!("=== Variant {label} ===");
-    println!("partitions: {partition_count} (target size ≈ {target_partition_size})");
+    println!("partitions: {partition_count} (target size ~ {target_partition_size})");
     println!("wall-clock build time: {:?}", wall_clock);
     println!(
         "aggregate main build time: {:?} | aggregate remainder build time: {:?}",
@@ -430,7 +411,7 @@ fn evaluate_partitioned_variant<MainFp, RemFp>(
         total_bytes, bytes_per_key
     );
     println!(
-        "partition key counts ⇒ min: {min_partition_keys}, max: {max_partition_keys}, avg: {:.2}, empty: {}",
+        "partition key counts => min: {min_partition_keys}, max: {max_partition_keys}, avg: {:.2}, empty: {}",
         if partition_count > 0 {
             key_count as f64 / partition_count as f64
         } else {

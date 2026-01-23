@@ -2,7 +2,7 @@
 
 This repository contains a ZOR filter implementation in Rust along with
 benchmarks and examples. A ZOR filter is an always-terminating continuation of
-the Binary Fuse filter: it keeps the fast query path and compact memory layout
+the fuse filter: it keeps the fast query path and compact memory layout
 of Fuse filters, but guarantees that construction never fails by abandoning
 keys when the peeling process blocks. The abandoned keys are then handled
 explicitly so the final structure behaves like a standard false-positive-only
@@ -56,10 +56,11 @@ unless those keys are handled separately.
 
 This codebase provides a **complete** two-stage filter:
 
-1. **Main ZOR layer**: build a Binary Fuse filter that may abandon keys.
-2. **Remainder layer**: build a second Binary Fuse filter on the abandoned keys
-   using a larger fingerprint width (e.g., 8/16 or 16/32 bits).
-3. **Exact fallback**: if the remainder layer still abandons keys (rare), store
+1. **Main ZOR layer**: build a fuse filter that may abandon keys.
+2. **Remainder layer**: build a lossless fuse filter on the abandoned keys
+   using a fingerprint that is always main +8 bits (e.g., 8/16 or 16/24).
+   The remainder uses fixed settings: overhead 1.1 and 4 hash functions.
+3. **Exact fallback**: if the remainder layer still abandons keys, store
    them exactly in a sorted vector.
 
 Queries return `present` if any stage matches. This removes false negatives at
@@ -77,6 +78,22 @@ When a block occurs, the code chooses which key to keep based on a heuristic:
 
 You can select these via `FilterConfig.cycle_break`.
 
+### Fixed parameters
+
+The implementation fixes a few parameters by design:
+
+- Main-layer overhead is always 1.0 (no `overhead` setting in `FilterConfig`).
+- Remainder fingerprint width is always main +8 bits.
+- Remainder uses overhead 1.1 and 4 hash functions.
+- `FilterConfig.tie_scan` defaults to 1.
+
+### Pure ZOR build (false negatives)
+
+If you want the fastest and smallest main layer with no auxiliary structure,
+use the pure build: it skips the remainder filter and therefore may return
+false negatives for abandoned keys. Use `ZorFilter::build_pure` or
+`ZorFilter::build_pure_with_config` for this mode.
+
 ## How to build the code
 
 Run all commands from the repo root (`/home/nadine/Code/ZOR`):
@@ -91,6 +108,29 @@ For faster execution (recommended for benchmarks):
 cargo build --release
 ```
 
+## API quick start
+
+```rust
+use zor_filter::{CycleBreakHeuristic, FilterConfig, ZorFilter};
+
+let keys: Vec<u64> = (0..1_000_000).collect();
+
+// Default complete build (8-bit main / 16-bit remainder).
+let build = ZorFilter::build(&keys).expect("build");
+
+// Custom main-layer configuration.
+let config = FilterConfig {
+    num_hashes: 8,
+    tie_scan: 1,
+    cycle_break: CycleBreakHeuristic::MostDeg2,
+    seed: 12345,
+};
+let build = ZorFilter::build_with_config(&keys, &config).expect("build");
+
+// Pure build (no remainder, may return false negatives).
+let pure = ZorFilter::build_pure(&keys).expect("build");
+```
+
 ## Running benchmarks
 
 ### Randomized benchmark (throughput + FP rate)
@@ -102,8 +142,6 @@ throughput, abandonment stats, and false positives.
 cargo run --release --example random_benchmark -- \
   --keys 1000000 \
   --queries 5000000 \
-  --overhead 1.00 \
-  --aux-overhead 1.01 \
   --aux-add-bytes 1 \
   --hashes 8 \
   --runs 10
@@ -113,9 +151,7 @@ Key flags:
 
 - `--keys`: number of keys to insert.
 - `--queries`: number of random queries.
-- `--overhead`: main ZOR layer memory factor (>= 1.0).
-- `--aux-overhead`: remainder layer memory factor.
-- `--aux-add-bytes`: extra bytes for remainder fingerprints.
+- `--aux-add-bytes`: extra bytes for auxiliary fingerprints in the benchmark.
 - `--hashes`: comma-separated list of hash counts to test.
 - `--cycle-break`: heuristic list (e.g., `most-deg2,lightest`).
 - `--runs`: iterations per configuration.
@@ -128,7 +164,6 @@ time, abandonment stats, and query performance.
 
 ```
 cargo run --release --example false_positive -- \
-  --overhead 1.0 \
   --hashes 8 \
   --seed 12345
 ```

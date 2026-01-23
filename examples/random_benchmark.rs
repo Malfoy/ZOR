@@ -8,10 +8,10 @@ use std::time::{Duration, Instant};
 
 mod fuse_filter;
 
-use fuse_filter::{FuseFilter, FuseFilterConfig};
+use fuse_filter::{AuxFuseConfig, AuxFuseFilter};
 use zor_filter::{
-    BinaryFuseFilter, BuildOutput, CycleBreakHeuristic, FilterConfig, Fingerprint1, Fingerprint2,
-    Fingerprint4, Fingerprint24, Fingerprint40, FingerprintValue,
+    BuildOutput, CycleBreakHeuristic, FilterConfig, Fingerprint1, Fingerprint2, Fingerprint4,
+    Fingerprint24, Fingerprint40, FingerprintValue, FuseFilter,
 };
 
 trait AuxFingerprintAdd<const ADD_BYTES: usize> {
@@ -110,7 +110,7 @@ macro_rules! run_benchmark_set {
             "8-bit",
             8.0,
             |keys, cfg| {
-                BinaryFuseFilter::build_8_with_config(keys, cfg).expect("8-bit filter should build")
+                FuseFilter::build_8_with_config(keys, cfg).expect("8-bit filter should build")
             },
         );
         run_benchmark_for_fp::<u16, $add, _>(
@@ -120,7 +120,7 @@ macro_rules! run_benchmark_set {
             "16-bit",
             16.0,
             |keys, cfg| {
-                BinaryFuseFilter::build_16_with_config(keys, cfg)
+                FuseFilter::build_16_with_config(keys, cfg)
                     .expect("16-bit filter should build")
             },
         );
@@ -131,7 +131,7 @@ macro_rules! run_benchmark_set {
             "24-bit",
             24.0,
             |keys, cfg| {
-                BinaryFuseFilter::<Fingerprint24>::build_generic_with_config(keys, cfg)
+                FuseFilter::<Fingerprint24>::build_generic_with_config(keys, cfg)
                     .expect("24-bit filter should build")
             },
         );
@@ -142,7 +142,7 @@ macro_rules! run_benchmark_set {
             "32-bit",
             32.0,
             |keys, cfg| {
-                BinaryFuseFilter::build_32_with_config(keys, cfg)
+                FuseFilter::build_32_with_config(keys, cfg)
                     .expect("32-bit filter should build")
             },
         );
@@ -156,11 +156,10 @@ fn run_benchmark(cli: &Cli, num_hashes: usize) {
         }
         println!("-- cycle_break={} --", cycle_break_label(cycle_break));
         println!(
-            "running {} iterations with key_count={}, query_count={}, overhead={}, num_hashes={}, threads={}, cascade={}, aux_add_bytes={}, tie_scan={}, cycle_break={}",
+            "running {} iterations with key_count={}, query_count={}, num_hashes={}, threads={}, cascade={}, aux_add_bytes={}, tie_scan={}, cycle_break={}",
             cli.runs,
             cli.key_count,
             cli.query_count,
-            cli.overhead,
             num_hashes,
             cli.threads,
             cli.cascade,
@@ -199,7 +198,6 @@ fn run_benchmark_for_fp<F, const ADD_BYTES: usize, BuildFn>(
     println!("--- fingerprint={label} ---");
 
     let config = FilterConfig {
-        overhead: cli.overhead,
         num_hashes,
         tie_scan: cli.tie_scan,
         cycle_break,
@@ -246,7 +244,6 @@ fn run_benchmark_for_fp<F, const ADD_BYTES: usize, BuildFn>(
         let runs = runs;
         let key_count = key_count;
         let query_count = query_count;
-        let aux_overhead = cli.aux_overhead;
         let cascade = cli.cascade;
 
         let handle = thread::spawn(move || loop {
@@ -279,12 +276,12 @@ fn run_benchmark_for_fp<F, const ADD_BYTES: usize, BuildFn>(
 
             let mut aux_bytes = 0u64;
             let mut aux_slots = 0u64;
-            let mut secondary_filter: Option<BinaryFuseFilter<AuxOf<F, ADD_BYTES>>> = None;
-            let mut aux_filter: Option<FuseFilter<AuxOf<F, ADD_BYTES>>> = None;
+            let mut secondary_filter: Option<FuseFilter<AuxOf<F, ADD_BYTES>>> = None;
+            let mut aux_filter: Option<AuxFuseFilter<AuxOf<F, ADD_BYTES>>> = None;
             if cascade {
                 if !missed_keys.is_empty() {
                     let secondary_build =
-                        BinaryFuseFilter::<AuxOf<F, ADD_BYTES>>::build_generic_with_config(
+                        FuseFilter::<AuxOf<F, ADD_BYTES>>::build_generic_with_config(
                             &missed_keys,
                             &config,
                         )
@@ -296,16 +293,14 @@ fn run_benchmark_for_fp<F, const ADD_BYTES: usize, BuildFn>(
                     secondary_filter = Some(secondary_build.filter);
 
                     if !secondary_build.abandoned_keys.is_empty() {
-                        let aux_build = FuseFilter::<AuxOf<F, ADD_BYTES>>::build(
+                        let aux_build = AuxFuseFilter::<AuxOf<F, ADD_BYTES>>::build(
                             &secondary_build.abandoned_keys,
-                            &FuseFilterConfig {
-                                overhead: aux_overhead,
+                            &AuxFuseConfig {
                                 seed: derive_seed(
                                     config.seed ^ 0xDEAD_BEEF_A55A_55AA,
                                     run as u64,
                                     worker_id as u64,
                                 ),
-                                num_hashes,
                             },
                         )
                         .expect("aux filter should build");
@@ -316,16 +311,14 @@ fn run_benchmark_for_fp<F, const ADD_BYTES: usize, BuildFn>(
                     }
                 }
             } else if !build.abandoned_keys.is_empty() {
-                let aux_build = FuseFilter::<AuxOf<F, ADD_BYTES>>::build(
+                let aux_build = AuxFuseFilter::<AuxOf<F, ADD_BYTES>>::build(
                     &build.abandoned_keys,
-                    &FuseFilterConfig {
-                        overhead: aux_overhead,
+                    &AuxFuseConfig {
                         seed: derive_seed(
                             config.seed ^ 0xDEAD_BEEF_A55A_55AA,
                             run as u64,
                             worker_id as u64,
                         ),
-                        num_hashes,
                     },
                 )
                 .expect("aux filter should build");
@@ -589,8 +582,8 @@ fn run_benchmark_for_fp<F, const ADD_BYTES: usize, BuildFn>(
 }
 
 fn contains_with_aux<MainF, AuxF>(
-    filter: &BinaryFuseFilter<MainF>,
-    aux: Option<&FuseFilter<AuxF>>,
+    filter: &FuseFilter<MainF>,
+    aux: Option<&AuxFuseFilter<AuxF>>,
     key: u64,
 ) -> bool
 where
@@ -604,9 +597,9 @@ where
 }
 
 fn contains_with_cascade<MainF, SecondaryF, AuxF>(
-    filter: &BinaryFuseFilter<MainF>,
-    secondary: Option<&BinaryFuseFilter<SecondaryF>>,
-    aux: Option<&FuseFilter<AuxF>>,
+    filter: &FuseFilter<MainF>,
+    secondary: Option<&FuseFilter<SecondaryF>>,
+    aux: Option<&AuxFuseFilter<AuxF>>,
     key: u64,
 ) -> bool
 where
@@ -627,8 +620,6 @@ where
 struct Cli {
     key_count: usize,
     query_count: usize,
-    overhead: f64,
-    aux_overhead: f64,
     aux_add_bytes: usize,
     tie_scan: usize,
     cycle_breaks: Vec<CycleBreakHeuristic>,
@@ -644,10 +635,8 @@ impl Cli {
         let mut cli = Self {
             key_count: 10_000_000,
             query_count: 10_000_000,
-            overhead: 1.00,
-            aux_overhead: 1.01,
             aux_add_bytes: 1,
-            tie_scan: 8,
+            tie_scan: 1,
             cycle_breaks: default_cycle_breaks(),
             cascade: false,
             hash_counts: vec![8],
@@ -682,8 +671,6 @@ impl Cli {
                     cli.query_count = parse(args.next(), "--queries");
                     query_count_set = true;
                 }
-                "--overhead" => cli.overhead = parse(args.next(), "--overhead"),
-                "--aux-overhead" => cli.aux_overhead = parse(args.next(), "--aux-overhead"),
                 "--aux-add-bytes" => cli.aux_add_bytes = parse(args.next(), "--aux-add-bytes"),
                 "--tie-scan" => cli.tie_scan = parse(args.next(), "--tie-scan"),
                 "--cycle-break" => {

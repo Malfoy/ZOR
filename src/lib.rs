@@ -1,9 +1,9 @@
-//! Binary Fuse filter implementation for 64-bit keys with optional remainder filter support.
+//! ZOR filter implementation for 64-bit keys.
 //!
-//! The base filter offers fast membership queries with low memory usage and configurable arity.
-//! Construct it from a collection of unique keys with [`BinaryFuseFilter::build`], or build a
-//! complete two-stage filter without false negatives using
-//! [`BinaryFuseFilter::build_complete`].
+//! The ZOR filter is an always-terminating continuation of a fuse filter.
+//! Build a complete ZOR filter with [`ZorFilter::build`] (or
+//! [`ZorFilter::build_with_config`]) and use [`ZorFilter::build_pure`] when you
+//! want the main layer only and can tolerate false negatives.
 
 use rayon::prelude::*;
 use std::cmp;
@@ -17,9 +17,14 @@ use std::time::{Duration, Instant};
 
 const MAX_HASHES: usize = 32;
 const MAX_SEGMENT_LENGTH_LOG: u32 = 12;
-const MAX_BINARY_FUSE_ATTEMPTS: usize = 32;
+const MAX_REMAINDER_ATTEMPTS: usize = 32;
 const MAX_LOSSLESS_FIXED_ATTEMPTS: usize = 512;
 const MAX_BEST_EFFORT_ATTEMPTS: usize = 1;
+const MAIN_OVERHEAD: f64 = 1.0;
+const REMAINDER_OVERHEAD: f64 = 1.1;
+const REMAINDER_HASHES: usize = 4;
+const REMAINDER_TIE_SCAN: usize = 1;
+const REMAINDER_SEED_XOR: u64 = 0xD6E8_FEB8_6659_FD93;
 
 #[derive(Clone, Copy, Debug)]
 struct Layout {
@@ -422,12 +427,10 @@ impl Default for CycleBreakHeuristic {
     }
 }
 
-/// Configuration options for building a [`BinaryFuseFilter`].
+/// Configuration options for building the ZOR main layer.
 #[derive(Clone, Copy, Debug)]
 pub struct FilterConfig {
-    /// Multiplicative overhead applied to the number of keys to estimate storage.
-    pub overhead: f64,
-    /// Number of hash functions used by the filter (between 3 and 16).
+    /// Number of hash functions used by the filter (between 2 and 32).
     pub num_hashes: usize,
     /// Number of tied high-degree cells to scan when breaking cycles.
     pub tie_scan: usize,
@@ -440,50 +443,26 @@ pub struct FilterConfig {
 impl Default for FilterConfig {
     fn default() -> Self {
         Self {
-            overhead: 1.0,
             num_hashes: 8,
-            tie_scan: 8,
+            tie_scan: 1,
             cycle_break: CycleBreakHeuristic::MostDeg2,
             seed: 69,
         }
     }
 }
 
-/// Configuration for [`BinaryFuseFilter::build_complete`].
-#[derive(Clone, Copy, Debug)]
-pub struct CompleteFilterConfig {
-    /// Configuration for the main 8-bit fingerprint filter.
-    pub main: FilterConfig,
-    /// Configuration for the remainder 16-bit fingerprint filter.
-    pub remainder: FilterConfig,
-}
-
-impl Default for CompleteFilterConfig {
-    fn default() -> Self {
-        let main = FilterConfig::default();
-        let remainder = FilterConfig {
-            overhead: main.overhead.max(1.3),
-            seed: main.seed ^ 0xD6E8_FEB8_6659_FD93,
-            num_hashes: main.num_hashes,
-            tie_scan: main.tie_scan,
-            cycle_break: main.cycle_break,
-        };
-        Self { main, remainder }
-    }
-}
-
-/// Output of building a [`BinaryFuseFilter`].
+/// Output of building a [`FuseFilter`].
 pub struct BuildOutput<Fingerprint = u8>
 where
     Fingerprint: FingerprintValue,
 {
-    pub filter: BinaryFuseFilter<Fingerprint>,
+    pub filter: FuseFilter<Fingerprint>,
     pub abandoned_keys: Vec<u64>,
     pub total_slots: usize,
     /// Number of slots that were not targeted by any key during construction.
     pub empty_slots: usize,
     pub actual_overhead: f64,
-    /// Keys that were satisfied “for free” via identical fingerprints in the same cell.
+    /// Keys that were satisfied "for free" via identical fingerprints in the same cell.
     pub free_inserted_keys: usize,
 }
 
@@ -500,14 +479,12 @@ pub type BuildOutput2 = BuildOutput<Fingerprint2>;
 /// Build output specialized for 4-bit fingerprints.
 pub type BuildOutput4 = BuildOutput<Fingerprint4>;
 
-/// Output of building a complete two-stage filter with [`BinaryFuseFilter::build_complete_8_16`]
-/// or [`BinaryFuseFilter::build_complete_16_32`].
-pub struct CompleteBuildOutput<MainFp = u8, RemFp = u16>
+/// Output of building a complete ZOR filter.
+pub struct ZorBuildOutput<MainFp = u8>
 where
-    MainFp: FingerprintValue,
-    RemFp: FingerprintValue,
+    MainFp: FingerprintValue + RemainderFingerprint,
 {
-    pub filter: CompleteFilter<MainFp, RemFp>,
+    pub filter: ZorFilter<MainFp>,
     pub main_abandoned_keys: Vec<u64>,
     pub remainder_abandoned_keys: Vec<u64>,
     pub fallback_key_count: usize,
@@ -521,14 +498,11 @@ where
     pub bytes_per_key: f64,
 }
 
-pub type CompleteBuildOutput8_16 = CompleteBuildOutput<u8, u16>;
-pub type CompleteBuildOutput16_32 = CompleteBuildOutput<u16, u32>;
-
 /// Configuration for partitioned construction.
 #[derive(Clone, Copy, Debug)]
 pub struct PartitionConfig {
     /// Base configuration used for each partition.
-    pub base: CompleteFilterConfig,
+    pub base: FilterConfig,
     /// Desired average number of keys per partition (must be greater than 0).
     pub target_partition_size: usize,
     /// Seed used to assign keys to partitions.
@@ -540,7 +514,7 @@ pub struct PartitionConfig {
 impl Default for PartitionConfig {
     fn default() -> Self {
         Self {
-            base: CompleteFilterConfig::default(),
+            base: FilterConfig::default(),
             target_partition_size: 100_000,
             partition_seed: 0xD4E9_CB4D_EF64_9B27,
             max_threads: 0,
@@ -577,12 +551,11 @@ pub struct PartitionStats {
 }
 
 /// Output of building partitioned filters.
-pub struct PartitionedBuildOutput<MainFp = u8, RemFp = u16>
+pub struct PartitionedBuildOutput<MainFp = u8>
 where
-    MainFp: FingerprintValue,
-    RemFp: FingerprintValue,
+    MainFp: FingerprintValue + RemainderFingerprint,
 {
-    pub filter: PartitionedCompleteFilter<MainFp, RemFp>,
+    pub filter: PartitionedZorFilter<MainFp>,
     pub partition_stats: Vec<PartitionStats>,
     pub total_bytes: usize,
     pub bytes_per_key: f64,
@@ -590,11 +563,9 @@ where
     pub total_remainder_build_time: Duration,
 }
 
-pub type PartitionedBuildOutput8_16 = PartitionedBuildOutput<u8, u16>;
-pub type PartitionedBuildOutput16_32 = PartitionedBuildOutput<u16, u32>;
-
-/// A static Binary Fuse filter for 64-bit keys parameterized over fingerprint width.
-pub struct BinaryFuseFilter<Fingerprint = u8>
+/// A static fuse filter for 64-bit keys parameterized over fingerprint width.
+/// Used internally to build ZOR filters.
+pub struct FuseFilter<Fingerprint = u8>
 where
     Fingerprint: FingerprintValue,
 {
@@ -604,42 +575,37 @@ where
     fingerprints: <Fingerprint as FingerprintValue>::Storage,
 }
 
-/// Binary Fuse filter using 4-bit fingerprints.
-pub type BinaryFuseFilter4 = BinaryFuseFilter<Fingerprint4>;
-/// Binary Fuse filter using 2-bit fingerprints.
-pub type BinaryFuseFilter2 = BinaryFuseFilter<Fingerprint2>;
-/// Binary Fuse filter using 1-bit fingerprints.
-pub type BinaryFuseFilter1 = BinaryFuseFilter<Fingerprint1>;
-/// Binary Fuse filter using 8-bit fingerprints.
-pub type BinaryFuseFilter8 = BinaryFuseFilter<u8>;
-/// Binary Fuse filter using 16-bit fingerprints.
-pub type BinaryFuseFilter16 = BinaryFuseFilter<u16>;
-/// Binary Fuse filter using 32-bit fingerprints.
-pub type BinaryFuseFilter32 = BinaryFuseFilter<u32>;
+/// Fuse filter using 4-bit fingerprints.
+pub type FuseFilter4 = FuseFilter<Fingerprint4>;
+/// Fuse filter using 2-bit fingerprints.
+pub type FuseFilter2 = FuseFilter<Fingerprint2>;
+/// Fuse filter using 1-bit fingerprints.
+pub type FuseFilter1 = FuseFilter<Fingerprint1>;
+/// Fuse filter using 8-bit fingerprints.
+pub type FuseFilter8 = FuseFilter<u8>;
+/// Fuse filter using 16-bit fingerprints.
+pub type FuseFilter16 = FuseFilter<u16>;
+/// Fuse filter using 32-bit fingerprints.
+pub type FuseFilter32 = FuseFilter<u32>;
 
-/// A composed filter made of a main Binary Fuse filter and an optional remainder filter augmented
+/// A composed filter made of a main ZOR layer and an optional remainder filter augmented
 /// with exact fallback storage.
-pub struct CompleteFilter<MainFp = u8, RemFp = u16>
+pub struct ZorFilter<MainFp = u8>
 where
-    MainFp: FingerprintValue,
-    RemFp: FingerprintValue,
+    MainFp: FingerprintValue + RemainderFingerprint,
 {
-    main: BinaryFuseFilter<MainFp>,
-    remainder: Option<BinaryFuseFilter<RemFp>>,
+    main: FuseFilter<MainFp>,
+    remainder: Option<FuseFilter<RemainderOf<MainFp>>>,
     fallback_keys: Vec<u64>,
 }
 
-pub type CompleteFilter8_16 = CompleteFilter<u8, u16>;
-pub type CompleteFilter16_32 = CompleteFilter<u16, u32>;
-
-/// A collection of partitioned complete filters.
-pub struct PartitionedCompleteFilter<MainFp = u8, RemFp = u16>
+/// A collection of partitioned ZOR filters.
+pub struct PartitionedZorFilter<MainFp = u8>
 where
-    MainFp: FingerprintValue,
-    RemFp: FingerprintValue,
+    MainFp: FingerprintValue + RemainderFingerprint,
 {
     partition_seed: u64,
-    filters: Vec<CompleteFilter<MainFp, RemFp>>,
+    filters: Vec<ZorFilter<MainFp>>,
 }
 
 pub trait FingerprintValue:
@@ -693,6 +659,29 @@ impl FingerprintValue for u64 {
     fn from_hash(hash: u64) -> Self {
         hash
     }
+}
+
+/// Maps a main fingerprint type to the remainder fingerprint type (+8 bits).
+pub trait RemainderFingerprint {
+    type Remainder: FingerprintValue;
+}
+
+pub type RemainderOf<F> = <F as RemainderFingerprint>::Remainder;
+
+impl RemainderFingerprint for u8 {
+    type Remainder = u16;
+}
+
+impl RemainderFingerprint for u16 {
+    type Remainder = Fingerprint24;
+}
+
+impl RemainderFingerprint for Fingerprint24 {
+    type Remainder = u32;
+}
+
+impl RemainderFingerprint for u32 {
+    type Remainder = Fingerprint40;
 }
 
 impl Default for Fingerprint1 {
@@ -851,14 +840,14 @@ impl FingerprintValue for Fingerprint40 {
 }
 
 #[allow(private_bounds)]
-impl<F> BinaryFuseFilter<F>
+impl<F> FuseFilter<F>
 where
     F: FingerprintValue,
 {
     fn build_internal(keys: &[u64], config: &FilterConfig) -> Result<BuildOutput<F>, BuildError> {
         validate_config(config)?;
 
-        let layout = calculate_layout(keys.len(), config)?;
+        let layout = calculate_layout(keys.len(), config.num_hashes, MAIN_OVERHEAD)?;
         let array_len = layout.array_length;
 
         if keys.is_empty() {
@@ -1351,7 +1340,7 @@ where
     }
 }
 
-impl BinaryFuseFilter {
+impl FuseFilter {
     /// Attempts to build an 8-bit fingerprint filter from the provided set of unique keys.
     pub fn build(keys: &[u64]) -> Result<BuildOutput, BuildError> {
         Self::build_with_config(keys, &FilterConfig::default())
@@ -1359,7 +1348,7 @@ impl BinaryFuseFilter {
 
     /// Attempts to build a 1-bit fingerprint filter from the provided set of unique keys.
     pub fn build_1(keys: &[u64]) -> Result<BuildOutput1, BuildError> {
-        BinaryFuseFilter::<Fingerprint1>::build_with_config(keys, &FilterConfig::default())
+        FuseFilter::<Fingerprint1>::build_with_config(keys, &FilterConfig::default())
     }
 
     /// Builds a 1-bit fingerprint filter using the supplied configuration.
@@ -1367,12 +1356,12 @@ impl BinaryFuseFilter {
         keys: &[u64],
         config: &FilterConfig,
     ) -> Result<BuildOutput1, BuildError> {
-        BinaryFuseFilter::<Fingerprint1>::build_with_config(keys, config)
+        FuseFilter::<Fingerprint1>::build_with_config(keys, config)
     }
 
     /// Attempts to build a 2-bit fingerprint filter from the provided set of unique keys.
     pub fn build_2(keys: &[u64]) -> Result<BuildOutput2, BuildError> {
-        BinaryFuseFilter::<Fingerprint2>::build_with_config(keys, &FilterConfig::default())
+        FuseFilter::<Fingerprint2>::build_with_config(keys, &FilterConfig::default())
     }
 
     /// Builds a 2-bit fingerprint filter using the supplied configuration.
@@ -1380,12 +1369,12 @@ impl BinaryFuseFilter {
         keys: &[u64],
         config: &FilterConfig,
     ) -> Result<BuildOutput2, BuildError> {
-        BinaryFuseFilter::<Fingerprint2>::build_with_config(keys, config)
+        FuseFilter::<Fingerprint2>::build_with_config(keys, config)
     }
 
     /// Attempts to build a 4-bit fingerprint filter from the provided set of unique keys.
     pub fn build_4(keys: &[u64]) -> Result<BuildOutput4, BuildError> {
-        BinaryFuseFilter::<Fingerprint4>::build_with_config(keys, &FilterConfig::default())
+        FuseFilter::<Fingerprint4>::build_with_config(keys, &FilterConfig::default())
     }
 
     /// Builds a 4-bit fingerprint filter using the supplied configuration.
@@ -1393,7 +1382,7 @@ impl BinaryFuseFilter {
         keys: &[u64],
         config: &FilterConfig,
     ) -> Result<BuildOutput4, BuildError> {
-        BinaryFuseFilter::<Fingerprint4>::build_with_config(keys, config)
+        FuseFilter::<Fingerprint4>::build_with_config(keys, config)
     }
 
     /// Builds an 8-bit fingerprint filter using the supplied configuration.
@@ -1414,7 +1403,7 @@ impl BinaryFuseFilter {
 
     /// Attempts to build a 16-bit fingerprint filter from the provided set of unique keys.
     pub fn build_16(keys: &[u64]) -> Result<BuildOutput16, BuildError> {
-        BinaryFuseFilter::<u16>::build_with_config(keys, &FilterConfig::default())
+        FuseFilter::<u16>::build_with_config(keys, &FilterConfig::default())
     }
 
     /// Builds a 16-bit fingerprint filter using the supplied configuration.
@@ -1422,12 +1411,12 @@ impl BinaryFuseFilter {
         keys: &[u64],
         config: &FilterConfig,
     ) -> Result<BuildOutput16, BuildError> {
-        BinaryFuseFilter::<u16>::build_with_config(keys, config)
+        FuseFilter::<u16>::build_with_config(keys, config)
     }
 
     /// Attempts to build a 32-bit fingerprint filter from the provided set of unique keys.
     pub fn build_32(keys: &[u64]) -> Result<BuildOutput32, BuildError> {
-        BinaryFuseFilter::<u32>::build_with_config(keys, &FilterConfig::default())
+        FuseFilter::<u32>::build_with_config(keys, &FilterConfig::default())
     }
 
     /// Builds a 32-bit fingerprint filter using the supplied configuration.
@@ -1435,78 +1424,12 @@ impl BinaryFuseFilter {
         keys: &[u64],
         config: &FilterConfig,
     ) -> Result<BuildOutput32, BuildError> {
-        BinaryFuseFilter::<u32>::build_with_config(keys, config)
+        FuseFilter::<u32>::build_with_config(keys, config)
     }
 
-    /// Builds a complete two-stage filter (8-bit main / 16-bit remainder) that eliminates false negatives.
-    pub fn build_complete(keys: &[u64]) -> Result<CompleteBuildOutput8_16, BuildError> {
-        Self::build_complete_8_16_with_config(keys, &CompleteFilterConfig::default())
-    }
-
-    /// Builds a complete two-stage filter (8-bit main / 16-bit remainder) using the supplied configuration.
-    pub fn build_complete_with_config(
-        keys: &[u64],
-        config: &CompleteFilterConfig,
-    ) -> Result<CompleteBuildOutput8_16, BuildError> {
-        Self::build_complete_8_16_with_config(keys, config)
-    }
-
-    /// Builds a complete two-stage filter with 8-bit ZOR layer and 16-bit remainder.
-    pub fn build_complete_8_16(keys: &[u64]) -> Result<CompleteBuildOutput8_16, BuildError> {
-        Self::build_complete_8_16_with_config(keys, &CompleteFilterConfig::default())
-    }
-
-    /// Builds a complete two-stage filter with 8-bit ZOR layer and 16-bit remainder using configuration.
-    pub fn build_complete_8_16_with_config(
-        keys: &[u64],
-        config: &CompleteFilterConfig,
-    ) -> Result<CompleteBuildOutput8_16, BuildError> {
-        build_complete_generic::<u8, u16>(keys, config)
-    }
-
-    /// Builds a complete two-stage filter with 16-bit ZOR layer and 32-bit remainder.
-    pub fn build_complete_16_32(keys: &[u64]) -> Result<CompleteBuildOutput16_32, BuildError> {
-        Self::build_complete_16_32_with_config(keys, &CompleteFilterConfig::default())
-    }
-
-    /// Builds a complete two-stage filter with 16-bit ZOR layer and 32-bit remainder using configuration.
-    pub fn build_complete_16_32_with_config(
-        keys: &[u64],
-        config: &CompleteFilterConfig,
-    ) -> Result<CompleteBuildOutput16_32, BuildError> {
-        build_complete_generic::<u16, u32>(keys, config)
-    }
-
-    /// Builds partitioned filters (8-bit main / 16-bit remainder) using default configuration.
-    pub fn build_partitioned_8_16(keys: &[u64]) -> Result<PartitionedBuildOutput8_16, BuildError> {
-        Self::build_partitioned_8_16_with_config(keys, &PartitionConfig::default())
-    }
-
-    /// Builds partitioned filters (8-bit main / 16-bit remainder) using the supplied configuration.
-    pub fn build_partitioned_8_16_with_config(
-        keys: &[u64],
-        config: &PartitionConfig,
-    ) -> Result<PartitionedBuildOutput8_16, BuildError> {
-        build_partitioned_generic::<u8, u16>(keys, config)
-    }
-
-    /// Builds partitioned filters (16-bit main / 32-bit remainder) using default configuration.
-    pub fn build_partitioned_16_32(
-        keys: &[u64],
-    ) -> Result<PartitionedBuildOutput16_32, BuildError> {
-        Self::build_partitioned_16_32_with_config(keys, &PartitionConfig::default())
-    }
-
-    /// Builds partitioned filters (16-bit main / 32-bit remainder) using the supplied configuration.
-    pub fn build_partitioned_16_32_with_config(
-        keys: &[u64],
-        config: &PartitionConfig,
-    ) -> Result<PartitionedBuildOutput16_32, BuildError> {
-        build_partitioned_generic::<u16, u32>(keys, config)
-    }
 }
 
-impl BinaryFuseFilter<u16> {
+impl FuseFilter<u16> {
     /// Builds a 16-bit fingerprint filter using the supplied configuration.
     pub fn build_with_config(
         keys: &[u64],
@@ -1516,7 +1439,7 @@ impl BinaryFuseFilter<u16> {
     }
 }
 
-impl BinaryFuseFilter<Fingerprint4> {
+impl FuseFilter<Fingerprint4> {
     /// Builds a 4-bit fingerprint filter using the supplied configuration.
     pub fn build_with_config(
         keys: &[u64],
@@ -1526,7 +1449,7 @@ impl BinaryFuseFilter<Fingerprint4> {
     }
 }
 
-impl BinaryFuseFilter<Fingerprint1> {
+impl FuseFilter<Fingerprint1> {
     /// Builds a 1-bit fingerprint filter using the supplied configuration.
     pub fn build_with_config(
         keys: &[u64],
@@ -1536,7 +1459,7 @@ impl BinaryFuseFilter<Fingerprint1> {
     }
 }
 
-impl BinaryFuseFilter<Fingerprint2> {
+impl FuseFilter<Fingerprint2> {
     /// Builds a 2-bit fingerprint filter using the supplied configuration.
     pub fn build_with_config(
         keys: &[u64],
@@ -1546,7 +1469,7 @@ impl BinaryFuseFilter<Fingerprint2> {
     }
 }
 
-impl BinaryFuseFilter<u32> {
+impl FuseFilter<u32> {
     /// Builds a 32-bit fingerprint filter using the supplied configuration.
     pub fn build_with_config(
         keys: &[u64],
@@ -1556,7 +1479,7 @@ impl BinaryFuseFilter<u32> {
     }
 }
 
-impl<F> BinaryFuseFilter<F>
+impl<F> FuseFilter<F>
 where
     F: FingerprintValue,
 {
@@ -1564,26 +1487,20 @@ where
         keys: &[u64],
         config: &FilterConfig,
     ) -> Result<BuildOutput<F>, BuildError> {
-        Self::build_lossless_with_config_internal(
-            keys,
-            config,
-            false,
-            MAX_LOSSLESS_FIXED_ATTEMPTS,
-        )
+        Self::build_lossless_with_config_internal(keys, config, MAX_LOSSLESS_FIXED_ATTEMPTS)
     }
 
     fn build_lossless_with_config_internal(
         keys: &[u64],
         config: &FilterConfig,
-        grow_overhead: bool,
         max_attempts: usize,
     ) -> Result<BuildOutput<F>, BuildError> {
         validate_config(config)?;
 
         if keys.is_empty() {
-            let layout = calculate_layout(0, config)?;
+            let layout = calculate_layout(0, config.num_hashes, REMAINDER_OVERHEAD)?;
             return Ok(BuildOutput {
-                filter: BinaryFuseFilter {
+                filter: FuseFilter {
                     seed: 0,
                     num_hashes: config.num_hashes,
                     layout,
@@ -1598,35 +1515,21 @@ where
         }
 
         let mut attempt_seed = config.seed;
-        let mut overhead = config.overhead.max(1.3);
 
         for attempt in 0..max_attempts {
             if attempt > 0 {
-                if grow_overhead {
-                    overhead *= 1.01;
-                }
                 attempt_seed = splitmix64(attempt_seed);
             }
-            let attempt_config = FilterConfig {
-                overhead,
-                num_hashes: config.num_hashes,
-                tie_scan: config.tie_scan,
-                cycle_break: config.cycle_break,
-                seed: attempt_seed,
-            };
-            let layout = calculate_layout(keys.len(), &attempt_config)?;
-            if let Ok(build) = Self::build_with_seed_lossless(
-                keys,
-                attempt_config.seed,
-                attempt_config.num_hashes,
-                layout,
-            ) {
+            let layout = calculate_layout(keys.len(), config.num_hashes, REMAINDER_OVERHEAD)?;
+            if let Ok(build) =
+                Self::build_with_seed_lossless(keys, attempt_seed, config.num_hashes, layout)
+            {
                 return Ok(build);
             }
         }
 
         Err(BuildError::ConstructionFailed(
-            "binary fuse remainder failed to build without abandoned keys",
+            "remainder filter failed to build without abandoned keys",
         ))
     }
 
@@ -1719,7 +1622,7 @@ where
 
         if stack.len() != keys.len() {
             return Err(BuildError::ConstructionFailed(
-                "binary fuse build failed without abandoned keys",
+                "lossless build failed without abandoned keys",
             ));
         }
 
@@ -1756,16 +1659,17 @@ where
     }
 }
 
-fn build_complete_generic<MainFp, RemFp>(
+fn build_zor_generic<MainFp>(
     keys: &[u64],
-    config: &CompleteFilterConfig,
-) -> Result<CompleteBuildOutput<MainFp, RemFp>, BuildError>
+    config: &FilterConfig,
+    build_remainder: bool,
+) -> Result<ZorBuildOutput<MainFp>, BuildError>
 where
-    MainFp: FingerprintValue + Send + 'static,
-    RemFp: FingerprintValue + Send + 'static,
+    MainFp: FingerprintValue + RemainderFingerprint + Send + 'static,
+    RemainderOf<MainFp>: FingerprintValue + Send + 'static,
 {
     let main_start = Instant::now();
-    let main_build = BinaryFuseFilter::<MainFp>::build_internal(keys, &config.main)?;
+    let main_build = FuseFilter::<MainFp>::build_internal(keys, config)?;
     let main_build_time = main_start.elapsed();
 
     let BuildOutput {
@@ -1779,10 +1683,13 @@ where
 
     let mut total_bytes = main_total_slots * mem::size_of::<MainFp>();
 
-    let mut remainder_candidates = Vec::with_capacity(main_abandoned_keys.len());
-    for &key in &main_abandoned_keys {
-        if !main_filter.contains(key) {
-            remainder_candidates.push(key);
+    let mut remainder_candidates = Vec::new();
+    if build_remainder {
+        remainder_candidates.reserve(main_abandoned_keys.len());
+        for &key in &main_abandoned_keys {
+            if !main_filter.contains(key) {
+                remainder_candidates.push(key);
+            }
         }
     }
 
@@ -1791,41 +1698,52 @@ where
     let mut remainder_total_slots = None;
     let mut remainder_actual_overhead = None;
     let mut remainder_build_time = Duration::default();
-    let remainder_filter = if remainder_candidates.is_empty() {
-        None
-    } else {
-        let adjusted_remainder_config = FilterConfig {
-            overhead: config.remainder.overhead.max(1.1),
-            tie_scan: config.remainder.tie_scan,
-            ..config.remainder
+    let remainder_filter = if build_remainder && !remainder_candidates.is_empty() {
+        let remainder_config = FilterConfig {
+            num_hashes: REMAINDER_HASHES,
+            tie_scan: REMAINDER_TIE_SCAN,
+            cycle_break: CycleBreakHeuristic::MostDeg2,
+            seed: config.seed ^ REMAINDER_SEED_XOR,
         };
         let remainder_start = Instant::now();
-        let remainder_build = BinaryFuseFilter::<RemFp>::build_lossless_with_config_internal(
+        let remainder_build = FuseFilter::<RemainderOf<MainFp>>::build_lossless_with_config_internal(
             &remainder_candidates,
-            &adjusted_remainder_config,
-            true,
-            MAX_BINARY_FUSE_ATTEMPTS,
-        )?;
+            &remainder_config,
+            MAX_REMAINDER_ATTEMPTS,
+        );
         remainder_build_time = remainder_start.elapsed();
 
-        let filter = remainder_build.filter;
-        remainder_total_slots = Some(remainder_build.total_slots);
-        remainder_actual_overhead = Some(remainder_build.actual_overhead);
-        remainder_abandoned_keys = remainder_build.abandoned_keys;
-        total_bytes += remainder_build.total_slots * mem::size_of::<RemFp>();
+        match remainder_build {
+            Ok(remainder_build) => {
+                let filter = remainder_build.filter;
+                remainder_total_slots = Some(remainder_build.total_slots);
+                remainder_actual_overhead = Some(remainder_build.actual_overhead);
+                remainder_abandoned_keys = remainder_build.abandoned_keys;
+                total_bytes += remainder_build.total_slots * mem::size_of::<RemainderOf<MainFp>>();
 
-        for &key in &remainder_candidates {
-            if !filter.contains(key) {
-                fallback_keys.push(key);
+                for &key in &remainder_candidates {
+                    if !filter.contains(key) {
+                        fallback_keys.push(key);
+                    }
+                }
+                if !remainder_abandoned_keys.is_empty() {
+                    fallback_keys.extend_from_slice(&remainder_abandoned_keys);
+                }
+                if !fallback_keys.is_empty() {
+                    fallback_keys.sort_unstable();
+                    fallback_keys.dedup();
+                }
+
+                Some(filter)
+            }
+            Err(_) => {
+                remainder_abandoned_keys = remainder_candidates;
+                fallback_keys = remainder_abandoned_keys.clone();
+                None
             }
         }
-
-        if !fallback_keys.is_empty() {
-            fallback_keys.sort_unstable();
-            fallback_keys.dedup();
-        }
-
-        Some(filter)
+    } else {
+        None
     };
 
     let fallback_key_count = fallback_keys.len();
@@ -1837,13 +1755,13 @@ where
         total_bytes as f64 / keys.len() as f64
     };
 
-    let filter = CompleteFilter {
+    let filter = ZorFilter {
         main: main_filter,
         remainder: remainder_filter,
         fallback_keys,
     };
 
-    Ok(CompleteBuildOutput {
+    Ok(ZorBuildOutput {
         filter,
         main_abandoned_keys,
         remainder_abandoned_keys,
@@ -1868,13 +1786,13 @@ fn validate_partition_config(config: &PartitionConfig) -> Result<(), BuildError>
     Ok(())
 }
 
-fn build_partitioned_generic<MainFp, RemFp>(
+fn build_partitioned_generic<MainFp>(
     keys: &[u64],
     config: &PartitionConfig,
-) -> Result<PartitionedBuildOutput<MainFp, RemFp>, BuildError>
+) -> Result<PartitionedBuildOutput<MainFp>, BuildError>
 where
-    MainFp: FingerprintValue + Send + 'static,
-    RemFp: FingerprintValue + Send + 'static,
+    MainFp: FingerprintValue + RemainderFingerprint + Send + 'static,
+    RemainderOf<MainFp>: FingerprintValue + Send + 'static,
 {
     validate_partition_config(config)?;
 
@@ -1899,11 +1817,11 @@ where
         config.max_threads
     };
 
-    let process = || -> Result<Vec<(CompleteFilter<MainFp, RemFp>, PartitionStats)>, BuildError> {
+    let process = || -> Result<Vec<(ZorFilter<MainFp>, PartitionStats)>, BuildError> {
         raw_partitions
             .into_par_iter()
             .map(|partition_keys| {
-                let build = build_complete_generic::<MainFp, RemFp>(&partition_keys, &config.base)?;
+                let build = build_zor_generic::<MainFp>(&partition_keys, &config.base, true)?;
                 let key_count = partition_keys.len();
                 let partition_total_bytes = build.total_bytes;
                 let partition_bytes_per_key = if key_count == 0 {
@@ -1962,7 +1880,7 @@ where
         total_bytes as f64 / keys.len() as f64
     };
 
-    let filter = PartitionedCompleteFilter {
+    let filter = PartitionedZorFilter {
         partition_seed: config.partition_seed,
         filters,
     };
@@ -1977,12 +1895,53 @@ where
     })
 }
 
+impl ZorFilter<u8> {
+    /// Builds a complete ZOR filter with default configuration (8-bit main / 16-bit remainder).
+    pub fn build(keys: &[u64]) -> Result<ZorBuildOutput<u8>, BuildError> {
+        Self::build_with_config(keys, &FilterConfig::default())
+    }
+
+    /// Builds a pure ZOR filter (main layer only) with default configuration.
+    pub fn build_pure(keys: &[u64]) -> Result<ZorBuildOutput<u8>, BuildError> {
+        Self::build_pure_with_config(keys, &FilterConfig::default())
+    }
+
+    /// Builds partitioned ZOR filters using the default configuration.
+    pub fn build_partitioned(keys: &[u64]) -> Result<PartitionedBuildOutput<u8>, BuildError> {
+        Self::build_partitioned_with_config(keys, &PartitionConfig::default())
+    }
+}
+
 #[allow(private_bounds)]
-impl<MainFp, RemFp> CompleteFilter<MainFp, RemFp>
+impl<MainFp> ZorFilter<MainFp>
 where
-    MainFp: FingerprintValue,
-    RemFp: FingerprintValue,
+    MainFp: FingerprintValue + RemainderFingerprint,
+    RemainderOf<MainFp>: FingerprintValue,
 {
+    /// Builds a complete ZOR filter using the supplied configuration.
+    pub fn build_with_config(
+        keys: &[u64],
+        config: &FilterConfig,
+    ) -> Result<ZorBuildOutput<MainFp>, BuildError> {
+        build_zor_generic::<MainFp>(keys, config, true)
+    }
+
+    /// Builds a pure ZOR filter (main layer only) using the supplied configuration.
+    pub fn build_pure_with_config(
+        keys: &[u64],
+        config: &FilterConfig,
+    ) -> Result<ZorBuildOutput<MainFp>, BuildError> {
+        build_zor_generic::<MainFp>(keys, config, false)
+    }
+
+    /// Builds partitioned ZOR filters using the supplied configuration.
+    pub fn build_partitioned_with_config(
+        keys: &[u64],
+        config: &PartitionConfig,
+    ) -> Result<PartitionedBuildOutput<MainFp>, BuildError> {
+        build_partitioned_generic::<MainFp>(keys, config)
+    }
+
     /// Returns true when `key` is (probably) in the set.
     /// Returns false when `key` is definitely not in the set.
     pub fn contains(&self, key: u64) -> bool {
@@ -1998,12 +1957,12 @@ where
     }
 
     /// Returns a reference to the main filter.
-    pub fn main_filter(&self) -> &BinaryFuseFilter<MainFp> {
+    pub fn main_filter(&self) -> &FuseFilter<MainFp> {
         &self.main
     }
 
     /// Returns a reference to the remainder filter if one was constructed.
-    pub fn remainder_filter(&self) -> Option<&BinaryFuseFilter<RemFp>> {
+    pub fn remainder_filter(&self) -> Option<&FuseFilter<RemainderOf<MainFp>>> {
         self.remainder.as_ref()
     }
 
@@ -2013,10 +1972,10 @@ where
     }
 }
 
-impl<MainFp, RemFp> PartitionedCompleteFilter<MainFp, RemFp>
+impl<MainFp> PartitionedZorFilter<MainFp>
 where
-    MainFp: FingerprintValue,
-    RemFp: FingerprintValue,
+    MainFp: FingerprintValue + RemainderFingerprint,
+    RemainderOf<MainFp>: FingerprintValue,
 {
     /// Returns true when `key` is (probably) in the set.
     /// Returns false when `key` is definitely not in the set.
@@ -2048,7 +2007,7 @@ where
     }
 
     /// Returns the complete filters for each partition.
-    pub fn partitions(&self) -> &[CompleteFilter<MainFp, RemFp>] {
+    pub fn partitions(&self) -> &[ZorFilter<MainFp>] {
         &self.filters
     }
 }
@@ -2059,11 +2018,6 @@ fn validate_config(config: &FilterConfig) -> Result<(), BuildError> {
             "num_hashes must be between 2 and 32",
         ));
     }
-    if !(config.overhead > 0.0) {
-        return Err(BuildError::InvalidConfig(
-            "overhead must be greater than 0.0",
-        ));
-    }
     if config.tie_scan == 0 {
         return Err(BuildError::InvalidConfig(
             "tie_scan must be greater than 0",
@@ -2072,9 +2026,12 @@ fn validate_config(config: &FilterConfig) -> Result<(), BuildError> {
     Ok(())
 }
 
-fn calculate_layout(key_count: usize, config: &FilterConfig) -> Result<Layout, BuildError> {
-    let num_hashes = config.num_hashes;
-    let target_slots = cmp::max(1, ((key_count as f64) * config.overhead).ceil() as usize);
+fn calculate_layout(
+    key_count: usize,
+    num_hashes: usize,
+    overhead: f64,
+) -> Result<Layout, BuildError> {
+    let target_slots = cmp::max(1, ((key_count as f64) * overhead).ceil() as usize);
     let mut segment_length = segment_length_for(num_hashes, target_slots);
     if segment_length == 0 {
         segment_length = 1;
@@ -2174,11 +2131,10 @@ mod tests {
     #[test]
     fn deterministic_membership() {
         let keys: Vec<u64> = (0..10_000).map(|i| i as u64 * 13_791).collect();
-        let build = BinaryFuseFilter::<u8>::build_lossless_with_config_internal(
+        let build = FuseFilter::<u8>::build_lossless_with_config_internal(
             &keys,
             &FilterConfig::default(),
-            true,
-            MAX_BINARY_FUSE_ATTEMPTS,
+            MAX_REMAINDER_ATTEMPTS,
         )
         .expect("filter should build");
         let abandoned: HashSet<u64> = build.abandoned_keys.iter().copied().collect();
@@ -2195,7 +2151,7 @@ mod tests {
     #[test]
     fn small_set() {
         let keys = [42_u64, 7, 1_000_000];
-        let build = BinaryFuseFilter::build(&keys).unwrap();
+        let build = FuseFilter::build(&keys).unwrap();
         let abandoned: HashSet<u64> = build.abandoned_keys.iter().copied().collect();
         let filter = build.filter;
         for k in keys {
@@ -2208,7 +2164,7 @@ mod tests {
 
     #[test]
     fn empty_set() {
-        let build = BinaryFuseFilter::build(&[]).unwrap();
+        let build = FuseFilter::build(&[]).unwrap();
         let filter = build.filter;
         assert!(!filter.contains(123));
     }
@@ -2217,15 +2173,14 @@ mod tests {
     fn configurable_hashes() {
         let keys: Vec<u64> = (0..5_000).map(|i| i as u64 * 7_919).collect();
         let config = FilterConfig {
-            overhead: 1.35,
             num_hashes: 4,
-            tie_scan: 8,
+            tie_scan: 1,
             cycle_break: CycleBreakHeuristic::MostDeg2,
             seed: 42,
         };
         let build =
-            BinaryFuseFilter::build_8_with_config(&keys, &config).expect("configurable filter");
-        assert!(build.actual_overhead >= config.overhead);
+            FuseFilter::build_8_with_config(&keys, &config).expect("configurable filter");
+        assert!(build.actual_overhead >= MAIN_OVERHEAD);
         let filter = build.filter;
         for &k in &keys {
             assert!(filter.contains(k));
@@ -2236,7 +2191,7 @@ mod tests {
     #[test]
     fn sixteen_bit_filter_builds() {
         let keys: Vec<u64> = (0..4_096).map(|i| splitmix64(i as u64)).collect();
-        let build = BinaryFuseFilter::build_16(&keys).expect("16-bit filter should build");
+        let build = FuseFilter::build_16(&keys).expect("16-bit filter should build");
         let abandoned: HashSet<u64> = build.abandoned_keys.iter().copied().collect();
         let filter = build.filter;
         for &k in &keys {
@@ -2249,7 +2204,7 @@ mod tests {
     #[test]
     fn thirty_two_bit_filter_builds() {
         let keys: Vec<u64> = (0..4_096).map(|i| splitmix64(i as u64)).collect();
-        let build = BinaryFuseFilter::build_32(&keys).expect("32-bit filter should build");
+        let build = FuseFilter::build_32(&keys).expect("32-bit filter should build");
         let abandoned: HashSet<u64> = build.abandoned_keys.iter().copied().collect();
         let filter = build.filter;
         for &k in &keys {
@@ -2262,7 +2217,7 @@ mod tests {
     #[test]
     fn four_bit_filter_is_packed_and_builds() {
         let keys: Vec<u64> = (0..2_048).map(|i| splitmix64(i as u64)).collect();
-        let build = BinaryFuseFilter::build_4(&keys).expect("4-bit filter should build");
+        let build = FuseFilter::build_4(&keys).expect("4-bit filter should build");
         let filter = build.filter;
         let expected_bytes = (build.total_slots + 1) / 2;
         assert_eq!(
@@ -2281,7 +2236,7 @@ mod tests {
     #[test]
     fn two_bit_filter_is_packed_and_builds() {
         let keys: Vec<u64> = (0..2_048).map(|i| splitmix64(i as u64)).collect();
-        let build = BinaryFuseFilter::build_2(&keys).expect("2-bit filter should build");
+        let build = FuseFilter::build_2(&keys).expect("2-bit filter should build");
         let filter = build.filter;
         let expected_bytes = (build.total_slots + 3) / 4;
         assert_eq!(
@@ -2300,7 +2255,7 @@ mod tests {
     #[test]
     fn one_bit_filter_is_packed_and_builds() {
         let keys: Vec<u64> = (0..1_024).map(|i| splitmix64(i as u64)).collect();
-        let build = BinaryFuseFilter::build_1(&keys).expect("1-bit filter should build");
+        let build = FuseFilter::build_1(&keys).expect("1-bit filter should build");
         let filter = build.filter;
         let expected_bytes = (build.total_slots + 7) / 8;
         assert_eq!(
@@ -2320,16 +2275,15 @@ mod tests {
     fn higher_arity_support() {
         let keys: Vec<u64> = (0..512).map(|i| i as u64 * 5_123).collect();
         let config = FilterConfig {
-            overhead: 1.5,
             num_hashes: 7,
-            tie_scan: 8,
+            tie_scan: 1,
             cycle_break: CycleBreakHeuristic::MostDeg2,
             seed: 123,
         };
         let build =
-            BinaryFuseFilter::build_8_with_config(&keys, &config).expect("higher arity filter");
+            FuseFilter::build_8_with_config(&keys, &config).expect("higher arity filter");
         let abandoned: HashSet<u64> = build.abandoned_keys.iter().copied().collect();
-        assert!(build.actual_overhead >= config.overhead);
+        assert!(build.actual_overhead >= MAIN_OVERHEAD);
         let filter = build.filter;
         for &k in &keys {
             if !abandoned.contains(&k) {
@@ -2340,8 +2294,8 @@ mod tests {
 
     #[test]
     fn fallback_contains_keys() {
-        let empty_main = BinaryFuseFilter::build(&[]).unwrap().filter;
-        let filter = CompleteFilter8_16 {
+        let empty_main = FuseFilter::build(&[]).unwrap().filter;
+        let filter = ZorFilter::<u8> {
             main: empty_main,
             remainder: None,
             fallback_keys: vec![2, 4, 6],
@@ -2357,37 +2311,33 @@ mod tests {
         let keys: Vec<u64> = (0..5_000)
             .map(|i| (i as u64).wrapping_mul(97_531))
             .collect();
-        let build = BinaryFuseFilter::build_complete(&keys).expect("complete filter should build");
+        let build = ZorFilter::build(&keys).expect("complete filter should build");
         let filter = build.filter;
         for &key in &keys {
             assert!(filter.contains(key), "missing key: {}", key);
         }
         assert_eq!(filter.fallback_keys().len(), build.fallback_key_count);
-        assert!(
-            build.remainder_abandoned_keys.is_empty(),
-            "binary fuse remainder left abandoned keys"
-        );
-        assert!(
-            filter.fallback_keys().is_empty(),
-            "fallback should be empty when remainder succeeds"
-        );
+        if build.remainder_abandoned_keys.is_empty() {
+            assert!(
+                filter.fallback_keys().is_empty(),
+                "fallback should be empty when remainder succeeds"
+            );
+        }
     }
 
     #[test]
     fn remainder_overhead_respects_minimum() {
         let keys: Vec<u64> = (0..2_048).map(|i| splitmix64(i as u64)).collect();
         let config = FilterConfig {
-            overhead: 1.0,
             num_hashes: 8,
-            tie_scan: 8,
+            tie_scan: 1,
             cycle_break: CycleBreakHeuristic::MostDeg2,
             seed: 123,
         };
-        let build = BinaryFuseFilter::<u16>::build_lossless_with_config_internal(
+        let build = FuseFilter::<u16>::build_lossless_with_config_internal(
             &keys,
             &config,
-            true,
-            MAX_BINARY_FUSE_ATTEMPTS,
+            MAX_REMAINDER_ATTEMPTS,
         )
         .expect("lossless remainder");
         let min_slots = ((keys.len() as f64) * 1.1).ceil() as usize;
@@ -2400,37 +2350,37 @@ mod tests {
     }
 
     #[test]
-    fn complete_filter_16_32_no_false_negatives() {
+    fn complete_filter_16_24_no_false_negatives() {
         let keys: Vec<u64> = (0..8_192)
             .map(|i| (i as u64).wrapping_mul(314_159))
             .collect();
-        let build = BinaryFuseFilter::build_complete_16_32(&keys)
-            .expect("16/32 complete filter should build");
+        let build =
+            ZorFilter::<u16>::build_with_config(&keys, &FilterConfig::default()).expect(
+                "16/24 complete filter should build",
+            );
         let filter = build.filter;
         for &key in &keys {
             assert!(filter.contains(key), "missing key: {}", key);
         }
         assert_eq!(filter.fallback_keys().len(), build.fallback_key_count);
-        assert!(
-            build.remainder_abandoned_keys.is_empty(),
-            "binary fuse remainder (32-bit) left abandoned keys"
-        );
-        assert!(
-            filter.fallback_keys().is_empty(),
-            "fallback should be empty when 32-bit remainder succeeds"
-        );
+        if build.remainder_abandoned_keys.is_empty() {
+            assert!(
+                filter.fallback_keys().is_empty(),
+                "fallback should be empty when remainder succeeds"
+            );
+        }
     }
 
     #[test]
     fn partitioned_complete_filter_no_false_negatives() {
         let keys: Vec<u64> = (0..20_000).map(|i| splitmix64(i as u64)).collect();
         let partition_config = PartitionConfig {
-            base: CompleteFilterConfig::default(),
+            base: FilterConfig::default(),
             target_partition_size: 3_000,
             partition_seed: 0x8C4E_FB5A_9D21_7C33,
             max_threads: 0,
         };
-        let build = BinaryFuseFilter::build_partitioned_8_16_with_config(&keys, &partition_config)
+        let build = ZorFilter::build_partitioned_with_config(&keys, &partition_config)
             .expect("partitioned complete filter should build");
         let PartitionedBuildOutput {
             filter,
