@@ -147,8 +147,6 @@ fn evaluate_variant<MainFp>(
     let zor_filter::ZorBuildOutput {
         filter,
         main_abandoned_keys,
-        remainder_abandoned_keys,
-        fallback_key_count,
         main_total_slots,
         main_actual_overhead,
         remainder_total_slots,
@@ -195,25 +193,13 @@ fn evaluate_variant<MainFp>(
             );
         }
     } else {
-        println!("remainder filter not constructed (no candidates or build failed)");
+        println!("remainder filter not constructed (no candidates)");
     }
     println!("main abandoned keys: {}", main_abandoned_keys.len());
-    println!(
-        "remainder abandoned keys: {}",
-        remainder_abandoned_keys.len()
-    );
-    println!("fallback keys stored exactly: {}", fallback_key_count);
     println!(
         "total bytes used: {} (bytes per key: {:.6})",
         total_bytes, bytes_per_key
     );
-
-    if !remainder_abandoned_keys.is_empty() {
-        println!(
-            "remainder abandoned keys (stored in fallback): {}",
-            remainder_abandoned_keys.len()
-        );
-    }
 
     let filter = Arc::new(filter);
     let mut false_negatives = 0usize;
@@ -382,11 +368,6 @@ fn evaluate_partitioned_variant<MainFp>(
     let partition_count = filter.len();
     let key_count = keys.len();
     let total_main_abandoned: usize = partition_stats.iter().map(|s| s.main_abandoned_keys).sum();
-    let total_remainder_abandoned: usize = partition_stats
-        .iter()
-        .map(|s| s.remainder_abandoned_keys)
-        .sum();
-    let total_fallback: usize = partition_stats.iter().map(|s| s.fallback_key_count).sum();
     let min_partition_keys = partition_stats
         .iter()
         .map(|s| s.key_count)
@@ -419,19 +400,7 @@ fn evaluate_partitioned_variant<MainFp>(
         },
         empty_partitions
     );
-    println!(
-        "main abandoned keys: {} | remainder abandoned keys: {} | fallback keys: {}",
-        total_main_abandoned, total_remainder_abandoned, total_fallback
-    );
-
-    assert!(
-        total_remainder_abandoned == 0,
-        "remainder layers should not abandon keys"
-    );
-    assert!(
-        total_fallback == 0,
-        "fallback storage should remain empty when remainder succeeds"
-    );
+    println!("main abandoned keys: {}", total_main_abandoned);
 
     let filter = Arc::new(filter);
     let mut false_negatives = 0usize;

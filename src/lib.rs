@@ -498,8 +498,6 @@ where
 {
     pub filter: ZorFilter<MainFp>,
     pub main_abandoned_keys: Vec<u64>,
-    pub remainder_abandoned_keys: Vec<u64>,
-    pub fallback_key_count: usize,
     pub main_total_slots: usize,
     pub main_actual_overhead: f64,
     pub remainder_total_slots: Option<usize>,
@@ -550,8 +548,6 @@ impl PartitionConfig {
 pub struct PartitionStats {
     pub key_count: usize,
     pub main_abandoned_keys: usize,
-    pub remainder_abandoned_keys: usize,
-    pub fallback_key_count: usize,
     pub main_total_slots: usize,
     pub main_actual_overhead: f64,
     pub remainder_total_slots: Option<usize>,
@@ -602,14 +598,13 @@ pub type FuseFilter16 = FuseFilter<u16>;
 pub type FuseFilter32 = FuseFilter<u32>;
 
 /// A composed filter made of a main ZOR layer and an optional remainder filter augmented
-/// with exact fallback storage.
+/// with a lossless remainder.
 pub struct ZorFilter<MainFp = u8>
 where
     MainFp: FingerprintValue + RemainderFingerprint,
 {
     main: FuseFilter<MainFp>,
     remainder: Option<FuseFilter<RemainderOf<MainFp>>>,
-    fallback_keys: Vec<u64>,
 }
 
 /// A collection of partitioned ZOR filters.
@@ -857,10 +852,33 @@ impl<F> FuseFilter<F>
 where
     F: FingerprintValue,
 {
+    pub fn build_with_segment_length(
+        keys: &[u64],
+        config: &FilterConfig,
+        segment_length: usize,
+    ) -> Result<BuildOutput<F>, BuildError> {
+        validate_config(config)?;
+        let layout = calculate_layout_with_segment_length(
+            keys.len(),
+            config.num_hashes,
+            MAIN_OVERHEAD,
+            segment_length,
+        )?;
+        Self::build_internal_with_layout(keys, config, layout)
+    }
+
     fn build_internal(keys: &[u64], config: &FilterConfig) -> Result<BuildOutput<F>, BuildError> {
         validate_config(config)?;
 
         let layout = calculate_layout(keys.len(), config.num_hashes, MAIN_OVERHEAD)?;
+        Self::build_internal_with_layout(keys, config, layout)
+    }
+
+    fn build_internal_with_layout(
+        keys: &[u64],
+        config: &FilterConfig,
+        layout: Layout,
+    ) -> Result<BuildOutput<F>, BuildError> {
         let array_len = layout.array_length;
 
         if keys.is_empty() {
@@ -1954,8 +1972,24 @@ where
     MainFp: FingerprintValue + RemainderFingerprint + Send + 'static,
     RemainderOf<MainFp>: FingerprintValue + Send + 'static,
 {
+    build_zor_generic_with_layout(keys, config, build_remainder, None)
+}
+
+fn build_zor_generic_with_layout<MainFp>(
+    keys: &[u64],
+    config: &FilterConfig,
+    build_remainder: bool,
+    layout: Option<Layout>,
+) -> Result<ZorBuildOutput<MainFp>, BuildError>
+where
+    MainFp: FingerprintValue + RemainderFingerprint + Send + 'static,
+    RemainderOf<MainFp>: FingerprintValue + Send + 'static,
+{
     let main_start = Instant::now();
-    let main_build = FuseFilter::<MainFp>::build_internal(keys, config)?;
+    let main_build = match layout {
+        Some(layout) => FuseFilter::<MainFp>::build_internal_with_layout(keys, config, layout)?,
+        None => FuseFilter::<MainFp>::build_internal(keys, config)?,
+    };
     let main_build_time = main_start.elapsed();
 
     let BuildOutput {
@@ -1979,8 +2013,6 @@ where
         }
     }
 
-    let mut fallback_keys = Vec::new();
-    let mut remainder_abandoned_keys = Vec::new();
     let mut remainder_total_slots = None;
     let mut remainder_actual_overhead = None;
     let mut remainder_build_time = Duration::default();
@@ -1998,41 +2030,20 @@ where
         );
         remainder_build_time = remainder_start.elapsed();
 
-        match remainder_build {
-            Ok(remainder_build) => {
-                let filter = remainder_build.filter;
-                remainder_total_slots = Some(remainder_build.total_slots);
-                remainder_actual_overhead = Some(remainder_build.actual_overhead);
-                remainder_abandoned_keys = remainder_build.abandoned_keys;
-                total_bytes += remainder_build.total_slots * mem::size_of::<RemainderOf<MainFp>>();
-
-                for &key in &remainder_candidates {
-                    if !filter.contains(key) {
-                        fallback_keys.push(key);
-                    }
-                }
-                if !remainder_abandoned_keys.is_empty() {
-                    fallback_keys.extend_from_slice(&remainder_abandoned_keys);
-                }
-                if !fallback_keys.is_empty() {
-                    fallback_keys.sort_unstable();
-                    fallback_keys.dedup();
-                }
-
-                Some(filter)
-            }
-            Err(_) => {
-                remainder_abandoned_keys = remainder_candidates;
-                fallback_keys = remainder_abandoned_keys.clone();
-                None
-            }
+        let remainder_build = remainder_build?;
+        if !remainder_build.abandoned_keys.is_empty() {
+            return Err(BuildError::ConstructionFailed(
+                "remainder filter abandoned keys",
+            ));
         }
+        let filter = remainder_build.filter;
+        remainder_total_slots = Some(remainder_build.total_slots);
+        remainder_actual_overhead = Some(remainder_build.actual_overhead);
+        total_bytes += remainder_build.total_slots * mem::size_of::<RemainderOf<MainFp>>();
+        Some(filter)
     } else {
         None
     };
-
-    let fallback_key_count = fallback_keys.len();
-    total_bytes += fallback_key_count * mem::size_of::<u64>();
 
     let bytes_per_key = if keys.is_empty() {
         0.0
@@ -2043,14 +2054,11 @@ where
     let filter = ZorFilter {
         main: main_filter,
         remainder: remainder_filter,
-        fallback_keys,
     };
 
     Ok(ZorBuildOutput {
         filter,
         main_abandoned_keys,
-        remainder_abandoned_keys,
-        fallback_key_count,
         main_total_slots,
         main_actual_overhead,
         remainder_total_slots,
@@ -2118,8 +2126,6 @@ where
                 let stats = PartitionStats {
                     key_count,
                     main_abandoned_keys: build.main_abandoned_keys.len(),
-                    remainder_abandoned_keys: build.remainder_abandoned_keys.len(),
-                    fallback_key_count: build.fallback_key_count,
                     main_total_slots: build.main_total_slots,
                     main_actual_overhead: build.main_actual_overhead,
                     remainder_total_slots: build.remainder_total_slots,
@@ -2211,6 +2217,21 @@ where
         build_zor_generic::<MainFp>(keys, config, true)
     }
 
+    /// Builds a complete ZOR filter using a fixed segment length.
+    pub fn build_with_segment_length(
+        keys: &[u64],
+        config: &FilterConfig,
+        segment_length: usize,
+    ) -> Result<ZorBuildOutput<MainFp>, BuildError> {
+        let layout = calculate_layout_with_segment_length(
+            keys.len(),
+            config.num_hashes,
+            MAIN_OVERHEAD,
+            segment_length,
+        )?;
+        build_zor_generic_with_layout::<MainFp>(keys, config, true, Some(layout))
+    }
+
     /// Builds a pure ZOR filter (main layer only) using the supplied configuration.
     pub fn build_pure_with_config(
         keys: &[u64],
@@ -2235,10 +2256,7 @@ where
                 return true;
             }
         }
-        if self.main.contains(key) {
-            return true;
-        }
-        self.fallback_keys.binary_search(&key).is_ok()
+        self.main.contains(key)
     }
 
     /// Returns a reference to the main filter.
@@ -2251,10 +2269,6 @@ where
         self.remainder.as_ref()
     }
 
-    /// Returns the list of fallback keys stored exactly.
-    pub fn fallback_keys(&self) -> &[u64] {
-        &self.fallback_keys
-    }
 }
 
 impl<MainFp> PartitionedZorFilter<MainFp>
@@ -2353,6 +2367,44 @@ fn calculate_layout(
     Ok(Layout {
         segment_length,
         segment_length_mask: segment_length - 1,
+        segment_count,
+        segment_count_length,
+        array_length,
+    })
+}
+
+fn calculate_layout_with_segment_length(
+    key_count: usize,
+    num_hashes: usize,
+    overhead: f64,
+    segment_length: usize,
+) -> Result<Layout, BuildError> {
+    if segment_length == 0 || !segment_length.is_power_of_two() {
+        return Err(BuildError::InvalidConfig(
+            "segment_length must be a non-zero power of two",
+        ));
+    }
+    let target_slots = cmp::max(1, ((key_count as f64) * overhead).ceil() as usize);
+    let segment_length_mask = segment_length - 1;
+    let mut total_segments = (target_slots + segment_length - 1) / segment_length;
+    if total_segments < num_hashes {
+        total_segments = num_hashes;
+    }
+    let mut segment_count = total_segments.saturating_sub(num_hashes - 1);
+    if segment_count == 0 {
+        segment_count = 1;
+    }
+    let total_segments_with_overlap = segment_count + num_hashes - 1;
+    let array_length = segment_length
+        .checked_mul(total_segments_with_overlap)
+        .ok_or(BuildError::InvalidConfig("filter size overflow"))?;
+    let segment_count_length = segment_length
+        .checked_mul(segment_count)
+        .ok_or(BuildError::InvalidConfig("filter size overflow"))?;
+
+    Ok(Layout {
+        segment_length,
+        segment_length_mask,
         segment_count,
         segment_count_length,
         array_length,
@@ -2719,20 +2771,6 @@ mod tests {
     }
 
     #[test]
-    fn fallback_contains_keys() {
-        let empty_main = FuseFilter::build(&[]).unwrap().filter;
-        let filter = ZorFilter::<u8> {
-            main: empty_main,
-            remainder: None,
-            fallback_keys: vec![2, 4, 6],
-        };
-        assert!(filter.contains(2));
-        assert!(filter.contains(4));
-        assert!(filter.contains(6));
-        assert!(!filter.contains(3));
-    }
-
-    #[test]
     fn complete_filter_no_false_negatives() {
         let keys: Vec<u64> = (0..5_000)
             .map(|i| (i as u64).wrapping_mul(97_531))
@@ -2741,13 +2779,6 @@ mod tests {
         let filter = build.filter;
         for &key in &keys {
             assert!(filter.contains(key), "missing key: {}", key);
-        }
-        assert_eq!(filter.fallback_keys().len(), build.fallback_key_count);
-        if build.remainder_abandoned_keys.is_empty() {
-            assert!(
-                filter.fallback_keys().is_empty(),
-                "fallback should be empty when remainder succeeds"
-            );
         }
     }
 
@@ -2788,13 +2819,6 @@ mod tests {
         for &key in &keys {
             assert!(filter.contains(key), "missing key: {}", key);
         }
-        assert_eq!(filter.fallback_keys().len(), build.fallback_key_count);
-        if build.remainder_abandoned_keys.is_empty() {
-            assert!(
-                filter.fallback_keys().is_empty(),
-                "fallback should be empty when remainder succeeds"
-            );
-        }
     }
 
     #[test]
@@ -2816,9 +2840,6 @@ mod tests {
         for &key in &keys {
             assert!(filter.contains(key), "missing key: {}", key);
         }
-        assert!(
-            partition_stats.iter().all(|s| s.fallback_key_count == 0),
-            "partitioned fallback storage should remain empty"
-        );
+        assert!(!partition_stats.is_empty());
     }
 }

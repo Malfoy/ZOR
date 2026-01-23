@@ -153,8 +153,6 @@ fn main() {
         let overhead_pct = (bits_per_key / 8.0 - 1.0) * 100.0;
         let main_abandoned_pct =
             (build.main_abandoned_keys.len() as f64 / key_count as f64) * 100.0;
-        let remainder_abandoned_pct =
-            (build.remainder_abandoned_keys.len() as f64 / key_count as f64) * 100.0;
 
         let pos_mq = (pos_queries.len() as f64 / pos_time) / 1_000_000.0;
         let neg_mq = (neg_queries.len() as f64 / neg_time) / 1_000_000.0;
@@ -162,11 +160,10 @@ fn main() {
         let neg_ns = (neg_time * 1_000_000_000.0) / neg_queries.len() as f64;
 
         println!(
-            "hashes={:>2} complete build={:>6.3} s main_abandon={:>7.4}% remainder_abandon={:>7.4}% bits/key={:>7.3} overhead={:>6.2}% pos={:>6.2} Mq/s ({:>6.2} ns/q) neg={:>6.2} Mq/s ({:>6.2} ns/q) pos_hits={} neg_hits={}",
+            "hashes={:>2} complete build={:>6.3} s main_abandon={:>7.4}% bits/key={:>7.3} overhead={:>6.2}% pos={:>6.2} Mq/s ({:>6.2} ns/q) neg={:>6.2} Mq/s ({:>6.2} ns/q) pos_hits={} neg_hits={}",
             num_hashes,
             build_time,
             main_abandoned_pct,
-            remainder_abandoned_pct,
             bits_per_key,
             overhead_pct,
             pos_mq,

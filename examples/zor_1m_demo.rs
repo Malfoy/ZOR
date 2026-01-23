@@ -39,11 +39,6 @@ fn main() {
         "main abandoned keys: {}",
         build.main_abandoned_keys.len()
     );
-    println!(
-        "remainder abandoned keys: {}",
-        build.remainder_abandoned_keys.len()
-    );
-    println!("fallback keys stored exactly: {}", build.fallback_key_count);
     println!("bytes per key: {:.6}", build.bytes_per_key);
 
     let filter = build.filter;

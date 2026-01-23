@@ -64,16 +64,13 @@ fn main() {
             let overhead_pct = (bits_per_key / 8.0 - 1.0) * 100.0;
             let main_abandoned_pct =
                 (build.main_abandoned_keys.len() as f64 / key_count as f64) * 100.0;
-            let remainder_abandoned_pct =
-                (build.remainder_abandoned_keys.len() as f64 / key_count as f64) * 100.0;
 
             println!(
-                "tie_scan={:>3} heuristic={:>12?} build={:>6.3} s main_abandon={:>7.4}% remainder_abandon={:>7.4}% bits/key={:>7.3} overhead={:>6.2}%",
+                "tie_scan={:>3} heuristic={:>12?} build={:>6.3} s main_abandon={:>7.4}% bits/key={:>7.3} overhead={:>6.2}%",
                 tie_scan,
                 heuristic,
                 build_time,
                 main_abandoned_pct,
-                remainder_abandoned_pct,
                 bits_per_key,
                 overhead_pct
             );
