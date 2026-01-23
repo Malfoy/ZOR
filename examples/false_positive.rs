@@ -13,7 +13,7 @@ fn main() {
     let keys: Vec<u64> = (0..key_count).map(|i| i as u64 * 13_791).collect();
     let key_set: Arc<HashSet<u64>> = Arc::new(keys.iter().copied().collect());
 
-    let mut num_hashes = 16;
+    let mut num_hashes = 4;
     let mut seed = 0_u64;
     let mut partition_size: Option<usize> = None;
     let mut partition_threads: Option<usize> = None;

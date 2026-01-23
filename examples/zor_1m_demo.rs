@@ -17,7 +17,7 @@ fn main() {
     // ------------------------------------------------------------
     let config = FilterConfig {
         // Number of hash functions (arity). Typical values: 4..16.
-        num_hashes: 8,
+        num_hashes: 4,
         // When breaking cycles, scan this many tied candidates.
         tie_scan: 1,
         // Heuristic used when abandoning keys.

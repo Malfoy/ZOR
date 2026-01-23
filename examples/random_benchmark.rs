@@ -640,7 +640,7 @@ impl Cli {
             cycle_breaks: default_cycle_breaks(),
             cascade: false,
             hash_counts: vec![8],
-            runs: 32,
+            runs: 8,
             seed: generate_seed(),
             threads: thread::available_parallelism()
                 .map(|n| n.get())

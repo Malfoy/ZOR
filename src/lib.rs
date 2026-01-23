@@ -17,20 +17,32 @@ use std::time::{Duration, Instant};
 
 const MAX_HASHES: usize = 32;
 const MAX_SEGMENT_LENGTH_LOG: u32 = 12;
+#[cfg(test)]
 const MAX_REMAINDER_ATTEMPTS: usize = 32;
 const MAX_LOSSLESS_FIXED_ATTEMPTS: usize = 512;
 const MAX_BEST_EFFORT_ATTEMPTS: usize = 1;
 const MAIN_OVERHEAD: f64 = 1.0;
-const REMAINDER_OVERHEAD: f64 = 1.1;
+const FUSE_OVERHEAD: f64 = 1.1;
+const REMAINDER_OVERHEAD: f64 = FUSE_OVERHEAD;
 const REMAINDER_HASHES: usize = 4;
 const REMAINDER_TIE_SCAN: usize = 1;
 const REMAINDER_SEED_XOR: u64 = 0xD6E8_FEB8_6659_FD93;
+const BINARY_FUSE_ARITY: usize = 4;
+const BINARY_FUSE_MAX_ITERATIONS: usize = 100;
+const BINARY_FUSE_MAX_SEGMENT_LENGTH: usize = 262_144;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HashingScheme {
+    SplitMix,
+    BinaryFuse,
+}
 
 #[derive(Clone, Copy, Debug)]
 struct Layout {
     segment_length: usize,
     segment_length_mask: usize,
     segment_count: usize,
+    segment_count_length: usize,
     array_length: usize,
 }
 
@@ -443,7 +455,7 @@ pub struct FilterConfig {
 impl Default for FilterConfig {
     fn default() -> Self {
         Self {
-            num_hashes: 8,
+            num_hashes: 4,
             tie_scan: 1,
             cycle_break: CycleBreakHeuristic::MostDeg2,
             seed: 69,
@@ -573,6 +585,7 @@ where
     num_hashes: usize,
     layout: Layout,
     fingerprints: <Fingerprint as FingerprintValue>::Storage,
+    hashing: HashingScheme,
 }
 
 /// Fuse filter using 4-bit fingerprints.
@@ -630,7 +643,7 @@ impl FingerprintValue for u8 {
 
     #[inline]
     fn from_hash(hash: u64) -> Self {
-        hash as u8
+        binary_fuse_fingerprint(hash) as u8
     }
 }
 
@@ -639,7 +652,7 @@ impl FingerprintValue for u16 {
 
     #[inline]
     fn from_hash(hash: u64) -> Self {
-        hash as u16
+        binary_fuse_fingerprint(hash) as u16
     }
 }
 
@@ -857,6 +870,7 @@ where
                     num_hashes: config.num_hashes,
                     layout,
                     fingerprints: F::Storage::new(array_len),
+                    hashing: HashingScheme::SplitMix,
                 },
                 abandoned_keys: Vec::new(),
                 total_slots: array_len,
@@ -917,13 +931,24 @@ where
             return false;
         }
 
-        let hash = mixsplit(key, self.seed);
-        let mut idx_buf = [0usize; MAX_HASHES];
-        let indexes = fill_indexes(hash, self.num_hashes, self.layout, &mut idx_buf);
+        let hash = match self.hashing {
+            HashingScheme::BinaryFuse => binary_fuse_mix_split(key, self.seed),
+            HashingScheme::SplitMix => mixsplit(key, self.seed),
+        };
 
         let mut fp = F::from_hash(hash);
-        for &i in indexes {
-            fp ^= self.fingerprints.get(i);
+
+        if self.hashing == HashingScheme::BinaryFuse {
+            let indexes = binary_fuse_hash_batch(hash, &self.layout);
+            for &index in &indexes {
+                fp ^= self.fingerprints.get(index);
+            }
+        } else {
+            let mut idx_buf = [0usize; MAX_HASHES];
+            let indexes = fill_indexes(hash, self.num_hashes, self.layout, &mut idx_buf);
+            for &i in indexes {
+                fp ^= self.fingerprints.get(i);
+            }
         }
 
         fp == F::default()
@@ -1305,6 +1330,7 @@ where
             num_hashes,
             layout,
             fingerprints,
+            hashing: HashingScheme::SplitMix,
         };
         if !keys.is_empty() {
             if !abandoned_keys.is_empty() {
@@ -1490,12 +1516,270 @@ where
         Self::build_lossless_with_config_internal(keys, config, MAX_LOSSLESS_FIXED_ATTEMPTS)
     }
 
+    fn build_binary_fuse_with_seed(
+        keys: &[u64],
+        seed: u64,
+    ) -> Result<BuildOutput<F>, BuildError> {
+        if keys.is_empty() {
+            let layout = calculate_binary_fuse_layout(0, FUSE_OVERHEAD);
+            return Ok(BuildOutput {
+                filter: FuseFilter {
+                    seed: 0,
+                    num_hashes: BINARY_FUSE_ARITY,
+                    layout,
+                    fingerprints: F::Storage::new(0),
+                    hashing: HashingScheme::BinaryFuse,
+                },
+                abandoned_keys: Vec::new(),
+                total_slots: layout.array_length,
+                empty_slots: layout.array_length,
+                actual_overhead: 0.0,
+                free_inserted_keys: 0,
+            });
+        }
+
+        let layout = calculate_binary_fuse_layout(keys.len(), FUSE_OVERHEAD);
+        let capacity = layout.array_length;
+        let size = keys.len();
+
+        if capacity == 0 {
+            return Err(BuildError::InvalidConfig(
+                "binary fuse layout too small",
+            ));
+        }
+        if capacity > (u32::MAX as usize) {
+            return Err(BuildError::InvalidConfig(
+                "binary fuse layout too large",
+            ));
+        }
+
+        let mut rng_counter = seed;
+        let mut seed = binary_fuse_rng_splitmix64(&mut rng_counter);
+
+        let mut reverse_order: Vec<u64> = vec![0; size + 1];
+        let mut reverse_h: Vec<u8> = vec![0; size];
+        let mut alone: Vec<u32> = vec![0; capacity];
+        let mut t2count: Vec<u8> = vec![0; capacity];
+        let mut t2hash: Vec<u64> = vec![0; capacity];
+
+        let mut block_bits: u32 = 1;
+        while (1_u32 << block_bits) < layout.segment_count as u32 {
+            block_bits += 1;
+        }
+        let block = 1_u32 << block_bits;
+        let mut start_pos: Vec<u32> = vec![0; block as usize];
+
+        let mut h012 = [0usize; 7];
+        let mut empty_slots = 0usize;
+        let mut success = false;
+
+        for _ in 0..BINARY_FUSE_MAX_ITERATIONS {
+            let mut duplicates = 0usize;
+            reverse_order.fill(0);
+            reverse_order[size] = 1;
+            reverse_h.fill(0);
+            t2count.fill(0);
+            t2hash.fill(0);
+
+            for i in 0_u32..block {
+                start_pos[i as usize] =
+                    (((i as u64) * (size as u64)) >> block_bits) as u32;
+            }
+
+            let mask_block = (block - 1) as u64;
+            for &key in keys {
+                let hash: u64 = binary_fuse_murmur64(key.wrapping_add(seed));
+                let mut segment_index: u64 = hash >> (64 - block_bits);
+                while reverse_order[start_pos[segment_index as usize] as usize] != 0 {
+                    segment_index = (segment_index + 1) & mask_block;
+                }
+                reverse_order[start_pos[segment_index as usize] as usize] = hash;
+                start_pos[segment_index as usize] += 1;
+            }
+
+            let mut error = false;
+            for &hash in reverse_order.iter().take(size) {
+                let h0: usize = binary_fuse_hash(0, hash, &layout);
+                t2count[h0] = t2count[h0].wrapping_add(4);
+                t2hash[h0] ^= hash;
+
+                let h1: usize = binary_fuse_hash(1, hash, &layout);
+                t2count[h1] = t2count[h1].wrapping_add(4);
+                t2count[h1] ^= 1;
+                t2hash[h1] ^= hash;
+
+                let h2: usize = binary_fuse_hash(2, hash, &layout);
+                t2count[h2] = t2count[h2].wrapping_add(4);
+                t2count[h2] ^= 2;
+                t2hash[h2] ^= hash;
+
+                let h3: usize = binary_fuse_hash(3, hash, &layout);
+                t2count[h3] = t2count[h3].wrapping_add(4);
+                t2count[h3] ^= 3;
+                t2hash[h3] ^= hash;
+
+                if (t2hash[h0] & t2hash[h1] & t2hash[h2] & t2hash[h3]) == 0 {
+                    if ((t2hash[h0] == 0) && (t2count[h0] == 8))
+                        || ((t2hash[h1] == 0) && (t2count[h1] == 8))
+                        || ((t2hash[h2] == 0) && (t2count[h2] == 8))
+                        || ((t2hash[h3] == 0) && (t2count[h3] == 8))
+                    {
+                        duplicates += 1;
+                        t2count[h0] = t2count[h0].wrapping_sub(4);
+                        t2hash[h0] ^= hash;
+                        t2count[h1] = t2count[h1].wrapping_sub(4);
+                        t2count[h1] ^= 1;
+                        t2hash[h1] ^= hash;
+                        t2count[h2] = t2count[h2].wrapping_sub(4);
+                        t2count[h2] ^= 2;
+                        t2hash[h2] ^= hash;
+                        t2count[h3] = t2count[h3].wrapping_sub(4);
+                        t2count[h3] ^= 3;
+                        t2hash[h3] ^= hash;
+                    }
+                }
+
+                if t2count[h0] < 4
+                    || t2count[h1] < 4
+                    || t2count[h2] < 4
+                    || t2count[h3] < 4
+                {
+                    error = true;
+                }
+            }
+
+            if error {
+                seed = binary_fuse_rng_splitmix64(&mut rng_counter);
+                continue;
+            }
+
+            empty_slots = t2count.iter().filter(|&&x| (x >> 2) == 0).count();
+
+            let mut q_size = 0_usize;
+            for (i, x) in t2count.iter().enumerate().take(capacity) {
+                if (x >> 2) == 1 {
+                    alone[q_size] = i as u32;
+                    q_size += 1;
+                }
+            }
+
+            let mut stack_size = 0_usize;
+
+            while q_size > 0 {
+                q_size -= 1;
+                let index = alone[q_size] as usize;
+                if (t2count[index] >> 2) == 1 {
+                    let hash: u64 = t2hash[index];
+
+                    h012[0] = binary_fuse_hash(0, hash, &layout);
+                    h012[1] = binary_fuse_hash(1, hash, &layout);
+                    h012[2] = binary_fuse_hash(2, hash, &layout);
+                    h012[3] = binary_fuse_hash(3, hash, &layout);
+                    h012[4] = h012[0];
+                    h012[5] = h012[1];
+                    h012[6] = h012[2];
+
+                    let found: usize = (t2count[index] & 3) as usize;
+                    reverse_h[stack_size] = found as u8;
+                    reverse_order[stack_size] = hash;
+                    stack_size += 1;
+
+                    let other_index1: usize = h012[found + 1];
+                    if (t2count[other_index1] >> 2) == 2 {
+                        alone[q_size] = other_index1 as u32;
+                        q_size += 1;
+                    }
+                    t2count[other_index1] = t2count[other_index1].wrapping_sub(4);
+                    t2count[other_index1] ^= binary_fuse_mod4((found + 1) as u8);
+                    t2hash[other_index1] ^= hash;
+
+                    let other_index2: usize = h012[found + 2];
+                    if (t2count[other_index2] >> 2) == 2 {
+                        alone[q_size] = other_index2 as u32;
+                        q_size += 1;
+                    }
+                    t2count[other_index2] = t2count[other_index2].wrapping_sub(4);
+                    t2count[other_index2] ^= binary_fuse_mod4((found + 2) as u8);
+                    t2hash[other_index2] ^= hash;
+
+                    let other_index3: usize = h012[found + 3];
+                    if (t2count[other_index3] >> 2) == 2 {
+                        alone[q_size] = other_index3 as u32;
+                        q_size += 1;
+                    }
+                    t2count[other_index3] = t2count[other_index3].wrapping_sub(4);
+                    t2count[other_index3] ^= binary_fuse_mod4((found + 3) as u8);
+                    t2hash[other_index3] ^= hash;
+                }
+            }
+
+            if (stack_size + duplicates) == size {
+                success = true;
+                break;
+            }
+
+            seed = binary_fuse_rng_splitmix64(&mut rng_counter);
+        }
+
+        if !success {
+            return Err(BuildError::ConstructionFailed(
+                "binary fuse build failed",
+            ));
+        }
+
+        let mut fingerprints = F::Storage::new(layout.array_length);
+        for i in (0_usize..size).rev() {
+            let hash: u64 = reverse_order[i];
+            let found: usize = reverse_h[i] as usize;
+            let indexes = binary_fuse_hash_batch(hash, &layout);
+            let mut value = F::from_hash(hash);
+            value ^= fingerprints.get(indexes[(found + 1) & 3]);
+            value ^= fingerprints.get(indexes[(found + 2) & 3]);
+            value ^= fingerprints.get(indexes[(found + 3) & 3]);
+            fingerprints.set(indexes[found], value);
+        }
+
+        Ok(BuildOutput {
+            filter: Self {
+                seed,
+                num_hashes: BINARY_FUSE_ARITY,
+                layout,
+                fingerprints,
+                hashing: HashingScheme::BinaryFuse,
+            },
+            abandoned_keys: Vec::new(),
+            total_slots: layout.array_length,
+            empty_slots,
+            actual_overhead: layout.array_length as f64 / keys.len() as f64,
+            free_inserted_keys: 0,
+        })
+    }
+
+    fn build_binary_fuse_with_config(
+        keys: &[u64],
+        config: &FilterConfig,
+    ) -> Result<BuildOutput<F>, BuildError> {
+        if config.num_hashes != BINARY_FUSE_ARITY {
+            return Err(BuildError::InvalidConfig(
+                "binary fuse requires num_hashes=4",
+            ));
+        }
+
+        Self::build_binary_fuse_with_seed(keys, config.seed)
+    }
+
     fn build_lossless_with_config_internal(
         keys: &[u64],
         config: &FilterConfig,
         max_attempts: usize,
     ) -> Result<BuildOutput<F>, BuildError> {
         validate_config(config)?;
+
+        if config.num_hashes == BINARY_FUSE_ARITY {
+            if let Ok(build) = Self::build_binary_fuse_with_config(keys, config) {
+                return Ok(build);
+            }
+        }
 
         if keys.is_empty() {
             let layout = calculate_layout(0, config.num_hashes, REMAINDER_OVERHEAD)?;
@@ -1505,6 +1789,7 @@ where
                     num_hashes: config.num_hashes,
                     layout,
                     fingerprints: F::Storage::new(0),
+                    hashing: HashingScheme::SplitMix,
                 },
                 abandoned_keys: Vec::new(),
                 total_slots: layout.array_length,
@@ -1645,6 +1930,7 @@ where
                 num_hashes,
                 layout,
                 fingerprints,
+                hashing: HashingScheme::SplitMix,
             },
             abandoned_keys: Vec::new(),
             total_slots: array_len,
@@ -1706,10 +1992,9 @@ where
             seed: config.seed ^ REMAINDER_SEED_XOR,
         };
         let remainder_start = Instant::now();
-        let remainder_build = FuseFilter::<RemainderOf<MainFp>>::build_lossless_with_config_internal(
+        let remainder_build = FuseFilter::<RemainderOf<MainFp>>::build_binary_fuse_with_seed(
             &remainder_candidates,
-            &remainder_config,
-            MAX_REMAINDER_ATTEMPTS,
+            remainder_config.seed,
         );
         remainder_build_time = remainder_start.elapsed();
 
@@ -2061,13 +2346,69 @@ fn calculate_layout(
     let _segment_count_length = segment_length
         .checked_mul(segment_count)
         .ok_or(BuildError::InvalidConfig("filter size overflow"))?;
+    let segment_count_length = segment_length
+        .checked_mul(segment_count)
+        .ok_or(BuildError::InvalidConfig("filter size overflow"))?;
 
     Ok(Layout {
         segment_length,
         segment_length_mask: segment_length - 1,
         segment_count,
+        segment_count_length,
         array_length,
     })
+}
+
+fn calculate_binary_fuse_layout(key_count: usize, min_overhead: f64) -> Layout {
+    if key_count == 0 {
+        return Layout {
+            segment_length: 1,
+            segment_length_mask: 0,
+            segment_count: 0,
+            segment_count_length: 0,
+            array_length: 0,
+        };
+    }
+
+    let arity = BINARY_FUSE_ARITY as u32;
+    let size = key_count as u32;
+    let mut segment_length = binary_fuse_calculate_segment_length(arity, size);
+    if segment_length == 0 {
+        segment_length = 1;
+    }
+    if segment_length as usize > BINARY_FUSE_MAX_SEGMENT_LENGTH {
+        segment_length = BINARY_FUSE_MAX_SEGMENT_LENGTH as u32;
+    }
+
+    let segment_length_mask = segment_length - 1;
+    let mut size_factor = binary_fuse_calculate_size_factor(arity, size);
+    if size_factor < min_overhead {
+        size_factor = min_overhead;
+    }
+    let cap = if size <= 1 {
+        0
+    } else {
+        ((size as f64) * size_factor).round() as u32
+    };
+
+    let n = ((cap + segment_length - 1) / segment_length).wrapping_sub(arity - 1);
+    let mut array_length = (n.wrapping_add(arity) - 1) * segment_length;
+    let mut segment_count = (array_length + segment_length - 1) / segment_length;
+    if segment_count <= (arity - 1) {
+        segment_count = 1;
+    } else {
+        segment_count -= arity - 1;
+    }
+    array_length = (segment_count + arity - 1) * segment_length;
+    let segment_count_length = segment_count * segment_length;
+
+    Layout {
+        segment_length: segment_length as usize,
+        segment_length_mask: segment_length_mask as usize,
+        segment_count: segment_count as usize,
+        segment_count_length: segment_count_length as usize,
+        array_length: array_length as usize,
+    }
 }
 
 fn segment_length_for(num_hashes: usize, key_count: usize) -> usize {
@@ -2108,6 +2449,91 @@ fn fill_indexes<'a>(
         h = splitmix64(h);
     }
     &out[..num_hashes]
+}
+
+#[inline]
+fn binary_fuse_murmur64(mut h: u64) -> u64 {
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xC4CE_B9FE_1A85_EC53);
+    h ^= h >> 33;
+    h
+}
+
+#[inline]
+fn binary_fuse_mix_split(key: u64, seed: u64) -> u64 {
+    binary_fuse_murmur64(key.wrapping_add(seed))
+}
+
+#[inline]
+fn binary_fuse_rng_splitmix64(seed: &mut u64) -> u64 {
+    *seed = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = *seed;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+#[inline]
+fn binary_fuse_mulhi(a: u64, b: u64) -> u64 {
+    (((a as u128) * (b as u128)) >> 64) as u64
+}
+
+#[inline]
+fn binary_fuse_calculate_segment_length(arity: u32, size: u32) -> u32 {
+    let ln_size = (size as f64).ln();
+    match arity {
+        3 => 1_u32 << ((ln_size / 3.33_f64.ln() + 2.25).floor() as u32),
+        4 => 1_u32 << ((ln_size / 2.91_f64.ln() - 0.50).floor() as u32),
+        _ => 65_536,
+    }
+}
+
+#[inline]
+fn binary_fuse_calculate_size_factor(arity: u32, size: u32) -> f64 {
+    let ln_size = (size as f64).ln();
+    match arity {
+        3 => 1.125_f64.max(0.875 + 0.250 * 1_000_000.0_f64.ln() / ln_size),
+        4 => 1.075_f64.max(0.770 + 0.305 * 600_000.0_f64.ln() / ln_size),
+        _ => 2.0,
+    }
+}
+
+#[inline]
+fn binary_fuse_mod4(x: u8) -> u8 {
+    x & 3
+}
+
+#[inline]
+fn binary_fuse_fingerprint(hash: u64) -> u64 {
+    hash ^ (hash >> 32)
+}
+
+#[inline]
+fn binary_fuse_hash_batch(hash: u64, layout: &Layout) -> [usize; BINARY_FUSE_ARITY] {
+    let segment_count_length = layout.segment_count_length as u64;
+    let segment_length = layout.segment_length as u64;
+    let mask = layout.segment_length_mask as u64;
+
+    let h0 = binary_fuse_mulhi(hash, segment_count_length) as u64;
+    let mut h1 = h0 + segment_length;
+    let mut h2 = h1 + segment_length;
+    let mut h3 = h2 + segment_length;
+    h1 ^= (hash >> 36) & mask;
+    h2 ^= (hash >> 18) & mask;
+    h3 ^= hash & mask;
+
+    [h0 as usize, h1 as usize, h2 as usize, h3 as usize]
+}
+
+#[inline]
+fn binary_fuse_hash(index: u32, hash: u64, layout: &Layout) -> usize {
+    let mut h = binary_fuse_mulhi(hash, layout.segment_count_length as u64);
+    h += (index as u64) * (layout.segment_length as u64);
+    let hh = hash & ((1_u64 << 54) - 1);
+    h ^= (hh >> (54 - 18 * index)) & (layout.segment_length_mask as u64);
+    h as usize
 }
 
 #[inline]

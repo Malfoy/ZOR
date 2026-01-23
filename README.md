@@ -59,9 +59,9 @@ This codebase provides a **complete** two-stage filter:
 1. **Main ZOR layer**: build a fuse filter that may abandon keys.
 2. **Remainder layer**: build a lossless fuse filter on the abandoned keys
    using a fingerprint that is always main +8 bits (e.g., 8/16 or 16/24).
-   The remainder uses fixed settings: overhead 1.1 and 4 hash functions.
-3. **Exact fallback**: if the remainder layer still abandons keys, store
-   them exactly in a sorted vector.
+   The remainder uses fixed settings: overhead 1.1 and 4 hash functions, and
+   always uses the optimized 4-way binary fuse construction regardless of the
+   main-layer configuration.
 
 Queries return `present` if any stage matches. This removes false negatives at
 the cost of a small increase in false positives, controlled by the fingerprint
@@ -120,7 +120,7 @@ let build = ZorFilter::build(&keys).expect("build");
 
 // Custom main-layer configuration.
 let config = FilterConfig {
-    num_hashes: 8,
+    num_hashes: 4,
     tie_scan: 1,
     cycle_break: CycleBreakHeuristic::MostDeg2,
     seed: 12345,
@@ -143,7 +143,7 @@ cargo run --release --example random_benchmark -- \
   --keys 1000000 \
   --queries 5000000 \
   --aux-add-bytes 1 \
-  --hashes 8 \
+  --hashes 4 \
   --runs 10
 ```
 
@@ -164,7 +164,7 @@ time, abandonment stats, and query performance.
 
 ```
 cargo run --release --example false_positive -- \
-  --hashes 8 \
+  --hashes 4 \
   --seed 12345
 ```
 
