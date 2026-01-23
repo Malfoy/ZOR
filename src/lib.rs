@@ -28,6 +28,7 @@ const REMAINDER_HASHES: usize = 4;
 const REMAINDER_TIE_SCAN: usize = 1;
 const REMAINDER_SEED_XOR: u64 = 0xD6E8_FEB8_6659_FD93;
 const BINARY_FUSE_ARITY: usize = 4;
+const FAST_ZOR_MAX_HASHES: usize = 8;
 const BINARY_FUSE_MAX_ITERATIONS: usize = 100;
 const BINARY_FUSE_MAX_SEGMENT_LENGTH: usize = 262_144;
 
@@ -1986,9 +1987,17 @@ where
     RemainderOf<MainFp>: FingerprintValue + Send + 'static,
 {
     let main_start = Instant::now();
-    let main_build = match layout {
-        Some(layout) => FuseFilter::<MainFp>::build_internal_with_layout(keys, config, layout)?,
-        None => FuseFilter::<MainFp>::build_internal(keys, config)?,
+    let main_build = if config.num_hashes <= FAST_ZOR_MAX_HASHES {
+        let layout = match layout {
+            Some(layout) => layout,
+            None => calculate_layout(keys.len(), config.num_hashes, MAIN_OVERHEAD)?,
+        };
+        build_zor_fast_main::<MainFp>(keys, config, layout)?
+    } else {
+        match layout {
+            Some(layout) => FuseFilter::<MainFp>::build_internal_with_layout(keys, config, layout)?,
+            None => FuseFilter::<MainFp>::build_internal(keys, config)?,
+        }
     };
     let main_build_time = main_start.elapsed();
 
@@ -2067,6 +2076,235 @@ where
         remainder_build_time,
         total_bytes,
         bytes_per_key,
+    })
+}
+
+fn build_zor_fast_main<F>(
+    keys: &[u64],
+    config: &FilterConfig,
+    layout: Layout,
+) -> Result<BuildOutput<F>, BuildError>
+where
+    F: FingerprintValue,
+{
+    validate_config(config)?;
+
+    if keys.is_empty() {
+        return Ok(BuildOutput {
+            filter: FuseFilter {
+                seed: 0,
+                num_hashes: config.num_hashes,
+                layout,
+                fingerprints: F::Storage::new(layout.array_length),
+                hashing: HashingScheme::SplitMix,
+            },
+            abandoned_keys: Vec::new(),
+            total_slots: layout.array_length,
+            empty_slots: layout.array_length,
+            actual_overhead: 0.0,
+            free_inserted_keys: 0,
+        });
+    }
+
+    if config.num_hashes == 0 || config.num_hashes > FAST_ZOR_MAX_HASHES {
+        return Err(BuildError::InvalidConfig(
+            "fast ZOR only supports up to 8 hashes",
+        ));
+    }
+    if keys.len() > (u32::MAX as usize) {
+        return Err(BuildError::InvalidConfig(
+            "fast ZOR requires key count <= u32::MAX",
+        ));
+    }
+
+    let array_len = layout.array_length;
+    let mut degrees = vec![0u32; array_len];
+    let mut xor_keys = vec![0u32; array_len];
+    let mut hashes = Vec::with_capacity(keys.len());
+    let mut idx_buf = [0usize; MAX_HASHES];
+
+    for (key_idx, &key) in keys.iter().enumerate() {
+        let hash = mixsplit(key, config.seed);
+        hashes.push(hash);
+        let indexes = fill_indexes(hash, config.num_hashes, layout, &mut idx_buf);
+        for &index in indexes {
+            degrees[index] = degrees[index].wrapping_add(1);
+            xor_keys[index] ^= key_idx as u32;
+        }
+    }
+
+    let empty_slots = degrees.iter().filter(|&&d| d == 0).count();
+    let mut max_degree = 0usize;
+    for &deg in &degrees {
+        if deg as usize > max_degree {
+            max_degree = deg as usize;
+        }
+    }
+
+    let mut adjacency_offsets = vec![0usize; array_len + 1];
+    let mut total_edges = 0usize;
+    for (slot, &degree) in degrees.iter().enumerate() {
+        adjacency_offsets[slot] = total_edges;
+        total_edges += degree as usize;
+    }
+    adjacency_offsets[array_len] = total_edges;
+
+    let mut adjacency = vec![0u32; total_edges];
+    {
+        let mut next_offset = adjacency_offsets[..array_len].to_vec();
+        for (key_idx, &hash) in hashes.iter().enumerate() {
+            let indexes = fill_indexes(hash, config.num_hashes, layout, &mut idx_buf);
+            for &index in indexes {
+                let pos = next_offset[index];
+                adjacency[pos] = key_idx as u32;
+                next_offset[index] += 1;
+            }
+        }
+    }
+
+    let mut active = vec![1u8; keys.len()];
+    let mut stack = Vec::with_capacity(keys.len());
+    let mut abandoned_keys = Vec::new();
+    let mut queue = Vec::with_capacity(array_len);
+    let mut buckets: Vec<Vec<usize>> = vec![Vec::new(); max_degree + 1];
+
+    for i in 0..array_len {
+        match degrees[i] {
+            1 => queue.push(i),
+            d if d > 1 => buckets[d as usize].push(i),
+            _ => {}
+        }
+    }
+
+    let mut min_bucket = 2usize;
+    while stack.len() + abandoned_keys.len() < keys.len() {
+        if let Some(cell) = queue.pop() {
+            if degrees[cell] != 1 {
+                continue;
+            }
+            let key_idx = xor_keys[cell] as usize;
+            if active[key_idx] == 0 {
+                degrees[cell] = 0;
+                continue;
+            }
+            active[key_idx] = 0;
+            stack.push((cell, key_idx));
+            let indexes = fill_indexes(hashes[key_idx], config.num_hashes, layout, &mut idx_buf);
+            for &index in indexes {
+                if degrees[index] == 0 {
+                    continue;
+                }
+                degrees[index] -= 1;
+                xor_keys[index] ^= key_idx as u32;
+                if degrees[index] == 1 {
+                    queue.push(index);
+                } else if degrees[index] >= 2 {
+                    buckets[degrees[index] as usize].push(index);
+                }
+            }
+            continue;
+        }
+
+        let mut cell = None;
+        while min_bucket <= max_degree {
+            while let Some(candidate) = buckets[min_bucket].pop() {
+                if degrees[candidate] as usize == min_bucket {
+                    cell = Some(candidate);
+                    break;
+                }
+            }
+            if cell.is_some() {
+                break;
+            }
+            min_bucket += 1;
+        }
+        let Some(cell) = cell else {
+            break;
+        };
+
+        let start = adjacency_offsets[cell];
+        let end = adjacency_offsets[cell + 1];
+        let mut abandon_key = None;
+        for pos in start..end {
+            let key_idx = adjacency[pos] as usize;
+            if active[key_idx] != 0 {
+                abandon_key = Some(key_idx);
+                break;
+            }
+        }
+        let Some(abandon_key) = abandon_key else {
+            degrees[cell] = 0;
+            continue;
+        };
+
+        active[abandon_key] = 0;
+        abandoned_keys.push(keys[abandon_key]);
+        let indexes = fill_indexes(hashes[abandon_key], config.num_hashes, layout, &mut idx_buf);
+        for &index in indexes {
+            if degrees[index] == 0 {
+                continue;
+            }
+            degrees[index] -= 1;
+            xor_keys[index] ^= abandon_key as u32;
+            if degrees[index] == 1 {
+                queue.push(index);
+            } else if degrees[index] >= 2 {
+                let degree = degrees[index] as usize;
+                if degree < min_bucket {
+                    min_bucket = degree;
+                }
+                buckets[degree].push(index);
+            }
+        }
+    }
+
+    for (key_idx, &flag) in active.iter().enumerate() {
+        if flag != 0 {
+            abandoned_keys.push(keys[key_idx]);
+        }
+    }
+
+    let mut fingerprints = F::Storage::new(array_len);
+    while let Some((cell, key_idx)) = stack.pop() {
+        let hash = hashes[key_idx];
+        let indexes = fill_indexes(hash, config.num_hashes, layout, &mut idx_buf);
+        let mut value = F::from_hash(hash);
+        for &index in indexes {
+            if index != cell {
+                value ^= fingerprints.get(index);
+            }
+        }
+        fingerprints.set(cell, value);
+    }
+
+    let filter = FuseFilter {
+        seed: config.seed,
+        num_hashes: config.num_hashes,
+        layout,
+        fingerprints,
+        hashing: HashingScheme::SplitMix,
+    };
+
+    let mut free_inserted = 0usize;
+    if !abandoned_keys.is_empty() {
+        let mut missed_keys = Vec::with_capacity(abandoned_keys.len());
+        for &key in &abandoned_keys {
+            if filter.contains(key) {
+                free_inserted += 1;
+            } else {
+                missed_keys.push(key);
+            }
+        }
+        abandoned_keys = missed_keys;
+    }
+
+    Ok(BuildOutput {
+        filter,
+        abandoned_keys,
+        total_slots: array_len,
+        empty_slots,
+        actual_overhead: array_len as f64 / keys.len() as f64,
+        free_inserted_keys: free_inserted,
     })
 }
 
@@ -2256,7 +2494,13 @@ where
                 return true;
             }
         }
-        self.main.contains(key)
+        if self.main.hashing == HashingScheme::SplitMix
+            && (2..=FAST_ZOR_MAX_HASHES).contains(&self.main.num_hashes)
+        {
+            contains_splitmix_fast(&self.main, key)
+        } else {
+            self.main.contains(key)
+        }
     }
 
     /// Returns a reference to the main filter.
@@ -2501,6 +2745,144 @@ fn fill_indexes<'a>(
         h = splitmix64(h);
     }
     &out[..num_hashes]
+}
+
+#[inline]
+fn contains_splitmix_fast<F>(filter: &FuseFilter<F>, key: u64) -> bool
+where
+    F: FingerprintValue,
+{
+    if filter.fingerprints.is_empty() {
+        return false;
+    }
+
+    let hash = mixsplit(key, filter.seed);
+    let mut fp = F::from_hash(hash);
+    let layout = filter.layout;
+    let segment_count = layout.segment_count as u64;
+    let base_segment = (((hash as u128) * (segment_count as u128)) >> 64) as u64;
+    let seg_len = layout.segment_length as u64;
+    let base_offset = base_segment * seg_len;
+    let mask = layout.segment_length_mask as u64;
+
+    let mut h = hash;
+    match filter.num_hashes {
+        2 => {
+            let idx0 = (base_offset + (h & mask)) as usize;
+            h = splitmix64(h);
+            let idx1 = (base_offset + seg_len + (h & mask)) as usize;
+            fp ^= filter.fingerprints.get(idx0);
+            fp ^= filter.fingerprints.get(idx1);
+        }
+        3 => {
+            let idx0 = (base_offset + (h & mask)) as usize;
+            h = splitmix64(h);
+            let idx1 = (base_offset + seg_len + (h & mask)) as usize;
+            h = splitmix64(h);
+            let idx2 = (base_offset + 2 * seg_len + (h & mask)) as usize;
+            fp ^= filter.fingerprints.get(idx0);
+            fp ^= filter.fingerprints.get(idx1);
+            fp ^= filter.fingerprints.get(idx2);
+        }
+        4 => {
+            let idx0 = (base_offset + (h & mask)) as usize;
+            h = splitmix64(h);
+            let idx1 = (base_offset + seg_len + (h & mask)) as usize;
+            h = splitmix64(h);
+            let idx2 = (base_offset + 2 * seg_len + (h & mask)) as usize;
+            h = splitmix64(h);
+            let idx3 = (base_offset + 3 * seg_len + (h & mask)) as usize;
+            fp ^= filter.fingerprints.get(idx0);
+            fp ^= filter.fingerprints.get(idx1);
+            fp ^= filter.fingerprints.get(idx2);
+            fp ^= filter.fingerprints.get(idx3);
+        }
+        5 => {
+            let idx0 = (base_offset + (h & mask)) as usize;
+            h = splitmix64(h);
+            let idx1 = (base_offset + seg_len + (h & mask)) as usize;
+            h = splitmix64(h);
+            let idx2 = (base_offset + 2 * seg_len + (h & mask)) as usize;
+            h = splitmix64(h);
+            let idx3 = (base_offset + 3 * seg_len + (h & mask)) as usize;
+            h = splitmix64(h);
+            let idx4 = (base_offset + 4 * seg_len + (h & mask)) as usize;
+            fp ^= filter.fingerprints.get(idx0);
+            fp ^= filter.fingerprints.get(idx1);
+            fp ^= filter.fingerprints.get(idx2);
+            fp ^= filter.fingerprints.get(idx3);
+            fp ^= filter.fingerprints.get(idx4);
+        }
+        6 => {
+            let idx0 = (base_offset + (h & mask)) as usize;
+            h = splitmix64(h);
+            let idx1 = (base_offset + seg_len + (h & mask)) as usize;
+            h = splitmix64(h);
+            let idx2 = (base_offset + 2 * seg_len + (h & mask)) as usize;
+            h = splitmix64(h);
+            let idx3 = (base_offset + 3 * seg_len + (h & mask)) as usize;
+            h = splitmix64(h);
+            let idx4 = (base_offset + 4 * seg_len + (h & mask)) as usize;
+            h = splitmix64(h);
+            let idx5 = (base_offset + 5 * seg_len + (h & mask)) as usize;
+            fp ^= filter.fingerprints.get(idx0);
+            fp ^= filter.fingerprints.get(idx1);
+            fp ^= filter.fingerprints.get(idx2);
+            fp ^= filter.fingerprints.get(idx3);
+            fp ^= filter.fingerprints.get(idx4);
+            fp ^= filter.fingerprints.get(idx5);
+        }
+        7 => {
+            let idx0 = (base_offset + (h & mask)) as usize;
+            h = splitmix64(h);
+            let idx1 = (base_offset + seg_len + (h & mask)) as usize;
+            h = splitmix64(h);
+            let idx2 = (base_offset + 2 * seg_len + (h & mask)) as usize;
+            h = splitmix64(h);
+            let idx3 = (base_offset + 3 * seg_len + (h & mask)) as usize;
+            h = splitmix64(h);
+            let idx4 = (base_offset + 4 * seg_len + (h & mask)) as usize;
+            h = splitmix64(h);
+            let idx5 = (base_offset + 5 * seg_len + (h & mask)) as usize;
+            h = splitmix64(h);
+            let idx6 = (base_offset + 6 * seg_len + (h & mask)) as usize;
+            fp ^= filter.fingerprints.get(idx0);
+            fp ^= filter.fingerprints.get(idx1);
+            fp ^= filter.fingerprints.get(idx2);
+            fp ^= filter.fingerprints.get(idx3);
+            fp ^= filter.fingerprints.get(idx4);
+            fp ^= filter.fingerprints.get(idx5);
+            fp ^= filter.fingerprints.get(idx6);
+        }
+        8 => {
+            let idx0 = (base_offset + (h & mask)) as usize;
+            h = splitmix64(h);
+            let idx1 = (base_offset + seg_len + (h & mask)) as usize;
+            h = splitmix64(h);
+            let idx2 = (base_offset + 2 * seg_len + (h & mask)) as usize;
+            h = splitmix64(h);
+            let idx3 = (base_offset + 3 * seg_len + (h & mask)) as usize;
+            h = splitmix64(h);
+            let idx4 = (base_offset + 4 * seg_len + (h & mask)) as usize;
+            h = splitmix64(h);
+            let idx5 = (base_offset + 5 * seg_len + (h & mask)) as usize;
+            h = splitmix64(h);
+            let idx6 = (base_offset + 6 * seg_len + (h & mask)) as usize;
+            h = splitmix64(h);
+            let idx7 = (base_offset + 7 * seg_len + (h & mask)) as usize;
+            fp ^= filter.fingerprints.get(idx0);
+            fp ^= filter.fingerprints.get(idx1);
+            fp ^= filter.fingerprints.get(idx2);
+            fp ^= filter.fingerprints.get(idx3);
+            fp ^= filter.fingerprints.get(idx4);
+            fp ^= filter.fingerprints.get(idx5);
+            fp ^= filter.fingerprints.get(idx6);
+            fp ^= filter.fingerprints.get(idx7);
+        }
+        _ => return filter.contains(key),
+    }
+
+    fp == F::default()
 }
 
 #[inline]
