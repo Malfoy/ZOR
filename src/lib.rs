@@ -36,6 +36,7 @@ const BINARY_FUSE_MAX_SEGMENT_LENGTH: usize = 262_144;
 enum HashingScheme {
     SplitMix,
     BinaryFuse,
+    SplitMixFast,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -952,21 +953,33 @@ where
 
         let hash = match self.hashing {
             HashingScheme::BinaryFuse => binary_fuse_mix_split(key, self.seed),
-            HashingScheme::SplitMix => mixsplit(key, self.seed),
+            HashingScheme::SplitMix | HashingScheme::SplitMixFast => mixsplit(key, self.seed),
         };
 
         let mut fp = F::from_hash(hash);
 
-        if self.hashing == HashingScheme::BinaryFuse {
-            let indexes = binary_fuse_hash_batch(hash, &self.layout);
-            for &index in &indexes {
-                fp ^= self.fingerprints.get(index);
+        match self.hashing {
+            HashingScheme::BinaryFuse => {
+                let indexes = binary_fuse_hash_batch(hash, &self.layout);
+                for &index in &indexes {
+                    fp ^= self.fingerprints.get(index);
+                }
             }
-        } else {
-            let mut idx_buf = [0usize; MAX_HASHES];
-            let indexes = fill_indexes(hash, self.num_hashes, self.layout, &mut idx_buf);
-            for &i in indexes {
-                fp ^= self.fingerprints.get(i);
+            HashingScheme::SplitMixFast => {
+                let hash2 = splitmix64(hash);
+                let mut idx_buf = [0usize; MAX_HASHES];
+                let indexes =
+                    fill_indexes_fast(hash, hash2, self.num_hashes, self.layout, &mut idx_buf);
+                for &i in indexes {
+                    fp ^= self.fingerprints.get(i);
+                }
+            }
+            HashingScheme::SplitMix => {
+                let mut idx_buf = [0usize; MAX_HASHES];
+                let indexes = fill_indexes(hash, self.num_hashes, self.layout, &mut idx_buf);
+                for &i in indexes {
+                    fp ^= self.fingerprints.get(i);
+                }
             }
         }
 
@@ -1987,7 +2000,10 @@ where
     RemainderOf<MainFp>: FingerprintValue + Send + 'static,
 {
     let main_start = Instant::now();
-    let main_build = if config.num_hashes <= FAST_ZOR_MAX_HASHES {
+    let use_fast_path = config.num_hashes <= FAST_ZOR_MAX_HASHES
+        && config.tie_scan == 1
+        && config.cycle_break == CycleBreakHeuristic::MostDeg2;
+    let main_build = if use_fast_path {
         let layout = match layout {
             Some(layout) => layout,
             None => calculate_layout(keys.len(), config.num_hashes, MAIN_OVERHEAD)?,
@@ -2096,7 +2112,7 @@ where
                 num_hashes: config.num_hashes,
                 layout,
                 fingerprints: F::Storage::new(layout.array_length),
-                hashing: HashingScheme::SplitMix,
+                hashing: HashingScheme::SplitMixFast,
             },
             abandoned_keys: Vec::new(),
             total_slots: layout.array_length,
@@ -2126,7 +2142,8 @@ where
     for (key_idx, &key) in keys.iter().enumerate() {
         let hash = mixsplit(key, config.seed);
         hashes.push(hash);
-        let indexes = fill_indexes(hash, config.num_hashes, layout, &mut idx_buf);
+        let hash2 = splitmix64(hash);
+        let indexes = fill_indexes_fast(hash, hash2, config.num_hashes, layout, &mut idx_buf);
         for &index in indexes {
             degrees[index] = degrees[index].wrapping_add(1);
             xor_keys[index] ^= key_idx as u32;
@@ -2153,7 +2170,8 @@ where
     {
         let mut next_offset = adjacency_offsets[..array_len].to_vec();
         for (key_idx, &hash) in hashes.iter().enumerate() {
-            let indexes = fill_indexes(hash, config.num_hashes, layout, &mut idx_buf);
+            let hash2 = splitmix64(hash);
+            let indexes = fill_indexes_fast(hash, hash2, config.num_hashes, layout, &mut idx_buf);
             for &index in indexes {
                 let pos = next_offset[index];
                 adjacency[pos] = key_idx as u32;
@@ -2189,7 +2207,9 @@ where
             }
             active[key_idx] = 0;
             stack.push((cell, key_idx));
-            let indexes = fill_indexes(hashes[key_idx], config.num_hashes, layout, &mut idx_buf);
+            let hash = hashes[key_idx];
+            let hash2 = splitmix64(hash);
+            let indexes = fill_indexes_fast(hash, hash2, config.num_hashes, layout, &mut idx_buf);
             for &index in indexes {
                 if degrees[index] == 0 {
                     continue;
@@ -2239,7 +2259,9 @@ where
 
         active[abandon_key] = 0;
         abandoned_keys.push(keys[abandon_key]);
-        let indexes = fill_indexes(hashes[abandon_key], config.num_hashes, layout, &mut idx_buf);
+        let hash = hashes[abandon_key];
+        let hash2 = splitmix64(hash);
+        let indexes = fill_indexes_fast(hash, hash2, config.num_hashes, layout, &mut idx_buf);
         for &index in indexes {
             if degrees[index] == 0 {
                 continue;
@@ -2267,7 +2289,8 @@ where
     let mut fingerprints = F::Storage::new(array_len);
     while let Some((cell, key_idx)) = stack.pop() {
         let hash = hashes[key_idx];
-        let indexes = fill_indexes(hash, config.num_hashes, layout, &mut idx_buf);
+        let hash2 = splitmix64(hash);
+        let indexes = fill_indexes_fast(hash, hash2, config.num_hashes, layout, &mut idx_buf);
         let mut value = F::from_hash(hash);
         for &index in indexes {
             if index != cell {
@@ -2282,7 +2305,7 @@ where
         num_hashes: config.num_hashes,
         layout,
         fingerprints,
-        hashing: HashingScheme::SplitMix,
+        hashing: HashingScheme::SplitMixFast,
     };
 
     let mut free_inserted = 0usize;
@@ -2489,18 +2512,15 @@ where
     /// Returns true when `key` is (probably) in the set.
     /// Returns false when `key` is definitely not in the set.
     pub fn contains(&self, key: u64) -> bool {
+        if self.main.contains(key) {
+            return true;
+        }
         if let Some(remainder) = &self.remainder {
             if remainder.contains(key) {
                 return true;
             }
         }
-        if self.main.hashing == HashingScheme::SplitMix
-            && (2..=FAST_ZOR_MAX_HASHES).contains(&self.main.num_hashes)
-        {
-            contains_splitmix_fast(&self.main, key)
-        } else {
-            self.main.contains(key)
-        }
+        false
     }
 
     /// Returns a reference to the main filter.
@@ -2748,141 +2768,31 @@ fn fill_indexes<'a>(
 }
 
 #[inline]
-fn contains_splitmix_fast<F>(filter: &FuseFilter<F>, key: u64) -> bool
-where
-    F: FingerprintValue,
-{
-    if filter.fingerprints.is_empty() {
-        return false;
+fn fill_indexes_fast<'a>(
+    hash1: u64,
+    hash2: u64,
+    num_hashes: usize,
+    layout: Layout,
+    out: &'a mut [usize; MAX_HASHES],
+) -> &'a [usize] {
+    if num_hashes == 0 || layout.array_length == 0 {
+        return &[];
     }
 
-    let hash = mixsplit(key, filter.seed);
-    let mut fp = F::from_hash(hash);
-    let layout = filter.layout;
     let segment_count = layout.segment_count as u64;
-    let base_segment = (((hash as u128) * (segment_count as u128)) >> 64) as u64;
-    let seg_len = layout.segment_length as u64;
-    let base_offset = base_segment * seg_len;
+    let base_segment = (((hash1 as u128) * (segment_count as u128)) >> 64) as u64;
+    let segment_length = layout.segment_length as u64;
+    let base_offset = base_segment * segment_length;
     let mask = layout.segment_length_mask as u64;
 
-    let mut h = hash;
-    match filter.num_hashes {
-        2 => {
-            let idx0 = (base_offset + (h & mask)) as usize;
-            h = splitmix64(h);
-            let idx1 = (base_offset + seg_len + (h & mask)) as usize;
-            fp ^= filter.fingerprints.get(idx0);
-            fp ^= filter.fingerprints.get(idx1);
-        }
-        3 => {
-            let idx0 = (base_offset + (h & mask)) as usize;
-            h = splitmix64(h);
-            let idx1 = (base_offset + seg_len + (h & mask)) as usize;
-            h = splitmix64(h);
-            let idx2 = (base_offset + 2 * seg_len + (h & mask)) as usize;
-            fp ^= filter.fingerprints.get(idx0);
-            fp ^= filter.fingerprints.get(idx1);
-            fp ^= filter.fingerprints.get(idx2);
-        }
-        4 => {
-            let idx0 = (base_offset + (h & mask)) as usize;
-            h = splitmix64(h);
-            let idx1 = (base_offset + seg_len + (h & mask)) as usize;
-            h = splitmix64(h);
-            let idx2 = (base_offset + 2 * seg_len + (h & mask)) as usize;
-            h = splitmix64(h);
-            let idx3 = (base_offset + 3 * seg_len + (h & mask)) as usize;
-            fp ^= filter.fingerprints.get(idx0);
-            fp ^= filter.fingerprints.get(idx1);
-            fp ^= filter.fingerprints.get(idx2);
-            fp ^= filter.fingerprints.get(idx3);
-        }
-        5 => {
-            let idx0 = (base_offset + (h & mask)) as usize;
-            h = splitmix64(h);
-            let idx1 = (base_offset + seg_len + (h & mask)) as usize;
-            h = splitmix64(h);
-            let idx2 = (base_offset + 2 * seg_len + (h & mask)) as usize;
-            h = splitmix64(h);
-            let idx3 = (base_offset + 3 * seg_len + (h & mask)) as usize;
-            h = splitmix64(h);
-            let idx4 = (base_offset + 4 * seg_len + (h & mask)) as usize;
-            fp ^= filter.fingerprints.get(idx0);
-            fp ^= filter.fingerprints.get(idx1);
-            fp ^= filter.fingerprints.get(idx2);
-            fp ^= filter.fingerprints.get(idx3);
-            fp ^= filter.fingerprints.get(idx4);
-        }
-        6 => {
-            let idx0 = (base_offset + (h & mask)) as usize;
-            h = splitmix64(h);
-            let idx1 = (base_offset + seg_len + (h & mask)) as usize;
-            h = splitmix64(h);
-            let idx2 = (base_offset + 2 * seg_len + (h & mask)) as usize;
-            h = splitmix64(h);
-            let idx3 = (base_offset + 3 * seg_len + (h & mask)) as usize;
-            h = splitmix64(h);
-            let idx4 = (base_offset + 4 * seg_len + (h & mask)) as usize;
-            h = splitmix64(h);
-            let idx5 = (base_offset + 5 * seg_len + (h & mask)) as usize;
-            fp ^= filter.fingerprints.get(idx0);
-            fp ^= filter.fingerprints.get(idx1);
-            fp ^= filter.fingerprints.get(idx2);
-            fp ^= filter.fingerprints.get(idx3);
-            fp ^= filter.fingerprints.get(idx4);
-            fp ^= filter.fingerprints.get(idx5);
-        }
-        7 => {
-            let idx0 = (base_offset + (h & mask)) as usize;
-            h = splitmix64(h);
-            let idx1 = (base_offset + seg_len + (h & mask)) as usize;
-            h = splitmix64(h);
-            let idx2 = (base_offset + 2 * seg_len + (h & mask)) as usize;
-            h = splitmix64(h);
-            let idx3 = (base_offset + 3 * seg_len + (h & mask)) as usize;
-            h = splitmix64(h);
-            let idx4 = (base_offset + 4 * seg_len + (h & mask)) as usize;
-            h = splitmix64(h);
-            let idx5 = (base_offset + 5 * seg_len + (h & mask)) as usize;
-            h = splitmix64(h);
-            let idx6 = (base_offset + 6 * seg_len + (h & mask)) as usize;
-            fp ^= filter.fingerprints.get(idx0);
-            fp ^= filter.fingerprints.get(idx1);
-            fp ^= filter.fingerprints.get(idx2);
-            fp ^= filter.fingerprints.get(idx3);
-            fp ^= filter.fingerprints.get(idx4);
-            fp ^= filter.fingerprints.get(idx5);
-            fp ^= filter.fingerprints.get(idx6);
-        }
-        8 => {
-            let idx0 = (base_offset + (h & mask)) as usize;
-            h = splitmix64(h);
-            let idx1 = (base_offset + seg_len + (h & mask)) as usize;
-            h = splitmix64(h);
-            let idx2 = (base_offset + 2 * seg_len + (h & mask)) as usize;
-            h = splitmix64(h);
-            let idx3 = (base_offset + 3 * seg_len + (h & mask)) as usize;
-            h = splitmix64(h);
-            let idx4 = (base_offset + 4 * seg_len + (h & mask)) as usize;
-            h = splitmix64(h);
-            let idx5 = (base_offset + 5 * seg_len + (h & mask)) as usize;
-            h = splitmix64(h);
-            let idx6 = (base_offset + 6 * seg_len + (h & mask)) as usize;
-            h = splitmix64(h);
-            let idx7 = (base_offset + 7 * seg_len + (h & mask)) as usize;
-            fp ^= filter.fingerprints.get(idx0);
-            fp ^= filter.fingerprints.get(idx1);
-            fp ^= filter.fingerprints.get(idx2);
-            fp ^= filter.fingerprints.get(idx3);
-            fp ^= filter.fingerprints.get(idx4);
-            fp ^= filter.fingerprints.get(idx5);
-            fp ^= filter.fingerprints.get(idx6);
-            fp ^= filter.fingerprints.get(idx7);
-        }
-        _ => return filter.contains(key),
+    let mut h = hash1;
+    for (i, slot) in out.iter_mut().take(num_hashes).enumerate() {
+        let variation = (h ^ (h >> 33)) & mask;
+        *slot = (base_offset + (i as u64) * segment_length + variation) as usize;
+        h = h.wrapping_add(hash2);
     }
 
-    fp == F::default()
+    &out[..num_hashes]
 }
 
 #[inline]

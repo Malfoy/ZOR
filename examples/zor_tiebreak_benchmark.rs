@@ -8,10 +8,10 @@ use bench_common::{generate_seed, random_keys, SplitMix64};
 use zor_filter::{CycleBreakHeuristic, FilterConfig, ZorFilter};
 
 fn main() {
-    let mut key_count = 10_000_000usize;
+    let mut key_count = 100_000_000usize;
     let mut num_hashes = 8usize;
     let mut seed = generate_seed();
-    let tie_scans = [10usize, 100usize];
+    let tie_scans = [10,100usize, 1000usize,10000usize,100000];
     let heuristics = [
         CycleBreakHeuristic::MostDeg2,
         CycleBreakHeuristic::Lightest,

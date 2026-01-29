@@ -8,7 +8,7 @@ use bench_common::{generate_seed, random_keys, SplitMix64};
 use zor_filter::{CycleBreakHeuristic, FilterConfig, ZorFilter};
 
 fn main() {
-    let mut key_count = 10_000_000usize;
+    let mut key_count = 100_000_000usize;
     let mut hash_counts = vec![8usize];
     let mut min_log = 6u32;
     let mut max_log = 12u32;
