@@ -1,7 +1,6 @@
 use std::env;
 use std::time::Instant;
 
-#[allow(dead_code)]
 mod bench_common;
 
 use bench_common::{generate_seed, random_keys, SplitMix64};
@@ -11,8 +10,9 @@ fn main() {
     let mut key_count = 100_000_000usize;
     let mut num_hashes = 8usize;
     let mut seed = generate_seed();
-    let tie_scans = [10,100usize, 1000usize,10000usize,100000];
+    let tie_scans = [1, 10, 100, 1000, 10000, 100000];
     let heuristics = [
+        CycleBreakHeuristic::NoHeuristic,
         CycleBreakHeuristic::MostDeg2,
         CycleBreakHeuristic::Lightest,
         CycleBreakHeuristic::Heaviest,

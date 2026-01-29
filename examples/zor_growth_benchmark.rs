@@ -1,11 +1,10 @@
 use std::env;
 use std::time::Instant;
 
-#[allow(dead_code)]
 mod bench_common;
 
 use bench_common::{generate_seed, random_keys, SplitMix64};
-use zor_filter::{CycleBreakHeuristic, FilterConfig, ZorFilter};
+use zor_filter::{CycleBreakHeuristic, FilterConfig, FuseFilter, ZorFilter};
 
 fn main() {
     let mut min_exp = 20u32;
@@ -53,6 +52,28 @@ fn main() {
             let mut more = random_keys(needed, &mut generator);
             keys.append(&mut more);
         }
+
+        let fuse_config = FilterConfig {
+            num_hashes: 4,
+            tie_scan: 1,
+            cycle_break: CycleBreakHeuristic::NoHeuristic,
+            seed,
+        };
+        let fuse_start = Instant::now();
+        let fuse_build =
+            FuseFilter::<u8>::build_lossless_with_config(&keys[..target], &fuse_config)
+                .expect("fuse build");
+        let fuse_time = fuse_start.elapsed().as_secs_f64();
+        let fuse_bits_per_key = (fuse_build.total_slots as f64 * 8.0) / target as f64;
+        let fuse_overhead_pct = (fuse_bits_per_key / 8.0 - 1.0) * 100.0;
+        println!(
+            "2^{:>2} keys={:>10} fuse4 build={:>6.3} s bits/key={:>7.3} overhead={:>6.2}%",
+            exp,
+            target,
+            fuse_time,
+            fuse_bits_per_key,
+            fuse_overhead_pct
+        );
 
         for &num_hashes in &hash_counts {
             let config = FilterConfig {

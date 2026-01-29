@@ -714,6 +714,7 @@ fn default_cycle_breaks() -> Vec<CycleBreakHeuristic> {
 
 fn cycle_break_label(heuristic: CycleBreakHeuristic) -> &'static str {
     match heuristic {
+        CycleBreakHeuristic::NoHeuristic => "none",
         CycleBreakHeuristic::Lightest => "lightest",
         CycleBreakHeuristic::Heaviest => "heaviest",
         CycleBreakHeuristic::MostDeg2 => "most-deg2",
@@ -747,12 +748,13 @@ fn parse_cycle_break(value: &str) -> CycleBreakHeuristic {
         .collect();
 
     match normalized.as_str() {
+        "none" | "noheuristic" | "no" | "off" | "fast" => CycleBreakHeuristic::NoHeuristic,
         "lightest" | "minweight" | "minsum" => CycleBreakHeuristic::Lightest,
         "heaviest" | "maxweight" | "maxsum" => CycleBreakHeuristic::Heaviest,
         "mostdeg2" | "deg2" | "most2" => CycleBreakHeuristic::MostDeg2,
         "minmaxdegree" | "minmax" | "minmaxdeg" => CycleBreakHeuristic::MinMaxDegree,
         _ => panic!(
-            "unknown cycle break heuristic: {value} (valid: lightest, heaviest, most-deg2, min-max-degree)"
+            "unknown cycle break heuristic: {value} (valid: none, lightest, heaviest, most-deg2, min-max-degree)"
         ),
     }
 }

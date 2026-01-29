@@ -2,10 +2,11 @@ use std::env;
 use std::hint::black_box;
 use std::time::Instant;
 
-#[allow(dead_code)]
 mod bench_common;
+mod fuse_filter;
 
 use bench_common::{generate_seed, random_keys, SplitMix64};
+use fuse_filter::{AuxFuseConfig, AuxFuseFilter};
 use zor_filter::{CycleBreakHeuristic, FilterConfig, FuseFilter, ZorFilter};
 
 fn parse_hashes(value: Option<String>, name: &str) -> Vec<usize> {
@@ -28,10 +29,11 @@ fn parse_hashes(value: Option<String>, name: &str) -> Vec<usize> {
 }
 
 fn main() {
-    let mut key_count = 10_000_000usize;
-    let mut query_count = 10_000_000usize;
+    let mut key_count = 100_000_000usize;
+    let mut query_count = 100_000_000usize;
     let mut num_hashes_list = vec![4usize, 6, 8, 10, 12, 14, 16];
     let mut seed = generate_seed();
+    let mut cascade = false;
 
     let mut args = env::args().skip(1);
     while let Some(flag) = args.next() {
@@ -50,6 +52,7 @@ fn main() {
             "--queries" => query_count = parse(args.next(), "--queries"),
             "--hashes" => num_hashes_list = parse_hashes(args.next(), "--hashes"),
             "--seed" => seed = parse(args.next(), "--seed"),
+            "--cascade" => cascade = true,
             other => panic!("unknown flag: {other}"),
         }
     }
@@ -129,7 +132,7 @@ fn main() {
         let build = ZorFilter::<u8>::build_with_config(&keys, &config).expect("build");
         let build_time = build_start.elapsed().as_secs_f64();
 
-        let filter = build.filter;
+        let filter = &build.filter;
 
         let pos_start = Instant::now();
         let mut pos_hits = 0usize;
@@ -178,7 +181,7 @@ fn main() {
         let pure_build = ZorFilter::<u8>::build_pure_with_config(&keys, &config).expect("pure");
         let pure_time = pure_start.elapsed().as_secs_f64();
 
-        let pure_filter = pure_build.filter;
+        let pure_filter = &pure_build.filter;
         let pure_pos_start = Instant::now();
         let mut pure_pos_hits = 0usize;
         for &q in &pos_queries {
@@ -221,5 +224,125 @@ fn main() {
             pure_pos_hits,
             pure_neg_hits
         );
+
+        if cascade {
+            let cascade_start = Instant::now();
+            let mut missed_keys = Vec::new();
+            missed_keys.reserve(pure_build.main_abandoned_keys.len());
+            for &key in &keys {
+                if !pure_filter.contains(key) {
+                    missed_keys.push(key);
+                }
+            }
+
+            let mut secondary_filter: Option<FuseFilter<u8>> = None;
+            let mut aux_filter: Option<AuxFuseFilter<u16>> = None;
+            let mut secondary_abandoned = 0usize;
+            let mut secondary_bytes = 0usize;
+            let mut aux_bytes = 0usize;
+            let mut secondary_slots = 0usize;
+            let mut aux_slots = 0usize;
+
+            if !missed_keys.is_empty() {
+                let secondary_build =
+                    FuseFilter::<u8>::build_generic_with_config(&missed_keys, &config)
+                        .expect("secondary filter should build");
+                secondary_abandoned = secondary_build.abandoned_keys.len();
+                secondary_bytes = secondary_build.filter.fingerprint_bytes();
+                secondary_slots = secondary_build.total_slots;
+
+                if !secondary_build.abandoned_keys.is_empty() {
+                    let aux_build = AuxFuseFilter::<u16>::build(
+                        &secondary_build.abandoned_keys,
+                        &AuxFuseConfig {
+                            seed: seed ^ 0xDEAD_BEEF_A55A_55AA,
+                        },
+                    )
+                    .expect("aux filter should build");
+                    aux_bytes = aux_build.filter.fingerprint_bytes();
+                    aux_slots = aux_build.total_slots;
+                    aux_filter = Some(aux_build.filter);
+                }
+
+                secondary_filter = Some(secondary_build.filter);
+            }
+
+            let cascade_build_time = cascade_start.elapsed().as_secs_f64();
+            let cascade_total_bytes =
+                pure_build.total_bytes + secondary_bytes + aux_bytes;
+            let cascade_bits_per_key =
+                (cascade_total_bytes as f64 / key_count as f64) * 8.0;
+            let cascade_overhead_pct = (cascade_bits_per_key / 8.0 - 1.0) * 100.0;
+
+            let main_filter = pure_filter.main_filter();
+            let cascade_pos_start = Instant::now();
+            let mut cascade_pos_hits = 0usize;
+            for &q in &pos_queries {
+                if black_box(contains_with_cascade(
+                    main_filter,
+                    secondary_filter.as_ref(),
+                    aux_filter.as_ref(),
+                    q,
+                )) {
+                    cascade_pos_hits += 1;
+                }
+            }
+            let cascade_pos_time = cascade_pos_start.elapsed().as_secs_f64();
+
+            let cascade_neg_start = Instant::now();
+            let mut cascade_neg_hits = 0usize;
+            for &q in &neg_queries {
+                if black_box(contains_with_cascade(
+                    main_filter,
+                    secondary_filter.as_ref(),
+                    aux_filter.as_ref(),
+                    q,
+                )) {
+                    cascade_neg_hits += 1;
+                }
+            }
+            let cascade_neg_time = cascade_neg_start.elapsed().as_secs_f64();
+
+            let cascade_pos_mq = (pos_queries.len() as f64 / cascade_pos_time) / 1_000_000.0;
+            let cascade_neg_mq = (neg_queries.len() as f64 / cascade_neg_time) / 1_000_000.0;
+            let cascade_pos_ns =
+                (cascade_pos_time * 1_000_000_000.0) / pos_queries.len() as f64;
+            let cascade_neg_ns =
+                (cascade_neg_time * 1_000_000_000.0) / neg_queries.len() as f64;
+            let missed_pct = (missed_keys.len() as f64 / key_count as f64) * 100.0;
+
+            println!(
+                "hashes={:>2} cascade build={:>6.3} s missed={:>7.4}% sec_abandon={} sec_slots={} aux_slots={} bits/key={:>7.3} overhead={:>6.2}% pos={:>6.2} Mq/s ({:>6.2} ns/q) neg={:>6.2} Mq/s ({:>6.2} ns/q) pos_hits={} neg_hits={}",
+                num_hashes,
+                cascade_build_time,
+                missed_pct,
+                secondary_abandoned,
+                secondary_slots,
+                aux_slots,
+                cascade_bits_per_key,
+                cascade_overhead_pct,
+                cascade_pos_mq,
+                cascade_pos_ns,
+                cascade_neg_mq,
+                cascade_neg_ns,
+                cascade_pos_hits,
+                cascade_neg_hits
+            );
+        }
     }
+}
+
+fn contains_with_cascade(
+    main: &FuseFilter<u8>,
+    secondary: Option<&FuseFilter<u8>>,
+    aux: Option<&AuxFuseFilter<u16>>,
+    key: u64,
+) -> bool {
+    if main.contains(key) {
+        return true;
+    }
+    if secondary.map_or(false, |filter| filter.contains(key)) {
+        return true;
+    }
+    aux.map_or(false, |filter| filter.contains(key))
 }

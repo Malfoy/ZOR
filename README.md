@@ -69,12 +69,15 @@ width in the remainder layer.
 
 ### Construction heuristics (cycle breaking)
 
-When a block occurs, the code chooses which key to keep based on a heuristic:
+When a block occurs, the code chooses which key to keep by scoring the set of
+keys that would be abandoned (all other incident keys) based on a heuristic.
+The default is **no heuristic** for maximum build speed.
 
-- `MostDeg2` (default): favor keys touching low-degree cells.
-- `Lightest`: smallest sum of degrees.
-- `Heaviest`: largest sum of degrees.
-- `MinMaxDegree`: minimize the maximum incident degree.
+- `NoHeuristic` (default): keep the first active key in a min-degree cell.
+- `MostDeg2`: maximize degree-2 incidences in the abandoned set.
+- `Lightest`: minimize the total sum of degrees in the abandoned set.
+- `Heaviest`: maximize the total sum of degrees in the abandoned set.
+- `MinMaxDegree`: minimize the maximum incident degree in the abandoned set.
 
 You can select these via `FilterConfig.cycle_break`.
 
@@ -131,12 +134,40 @@ let build = ZorFilter::build_with_config(&keys, &config).expect("build");
 let pure = ZorFilter::build_pure(&keys).expect("build");
 ```
 
-## Running benchmarks
+## Demo (start here)
 
-### Randomized benchmark (throughput + FP rate)
+The file `examples/zor_demo.rs` is the kitchen-sink walkthrough. It is heavily
+commented and showcases **all** available ZOR build modes and APIs, including
+custom configs, fixed segment length, pure builds, wider fingerprints, and
+partitioned construction.
 
-This benchmark builds filters across multiple fingerprint sizes and prints
-throughput, abandonment stats, and false positives.
+Run the default path (complete build, 1M keys):
+
+```
+cargo run --release --example zor_demo
+```
+
+See all available sections/flags:
+
+```
+cargo run --release --example zor_demo -- --help
+```
+
+Run every section (slow; consider lowering `--keys`):
+
+```
+cargo run --release --example zor_demo -- --all --keys 200000
+```
+
+## Benchmarks
+
+Each benchmark is an `examples/` entry point and can be run via
+`cargo run --release --example <name> -- <flags>`.
+
+### `random_benchmark`: randomized throughput + FP rate
+
+Builds filters across multiple fingerprint sizes and prints throughput,
+abandonment stats, and false positives.
 
 ```
 cargo run --release --example random_benchmark -- \
@@ -152,15 +183,18 @@ Key flags:
 - `--keys`: number of keys to insert.
 - `--queries`: number of random queries.
 - `--aux-add-bytes`: extra bytes for auxiliary fingerprints in the benchmark.
-- `--hashes`: comma-separated list of hash counts to test.
+- `--tie-scan`: number of tied candidates scanned when breaking cycles.
 - `--cycle-break`: heuristic list (e.g., `most-deg2,lightest`).
+- `--cascade`: enable cascading aux filters for abandoned keys.
+- `--hashes`: comma-separated list of hash counts to test.
 - `--runs`: iterations per configuration.
+- `--seed`: base RNG seed.
 - `--threads`: parallel query threads.
 
-### False-positive measurement demo
+### `false_positive`: false-positive measurement + partitioned variants
 
-The `false_positive.rs` example builds a complete ZOR filter and reports build
-time, abandonment stats, and query performance.
+Builds complete ZOR filters (8/16 and 16/24) and reports build time,
+abandonment stats, and query performance. Optionally runs partitioned builds.
 
 ```
 cargo run --release --example false_positive -- \
@@ -168,26 +202,133 @@ cargo run --release --example false_positive -- \
   --seed 12345
 ```
 
-## Example: build and query a ZOR filter for 1M integers
+Key flags:
 
-The file `examples/zor_1m_demo.rs` is a small, heavily commented example that:
+- `--hashes`: hash count for the main filter.
+- `--seed`: hash seed.
+- `--partition-size`: enable partitioned builds with this target size.
+- `--partition-threads`: override worker count for partitioned builds.
 
-- Builds a **complete** ZOR filter from 1,000,000 integers.
-- Prints build stats (abandoned keys, bytes per key).
-- Queries known-present and known-absent keys.
-- Optionally scans the full key set to show there are no false negatives.
+### `optimized_fuse_benchmark`: lossless binary fuse baseline
 
-Run it with:
+Measures build/query throughput for lossless 4-way binary fuse construction.
 
 ```
-cargo run --release --example zor_1m_demo
+cargo run --release --example optimized_fuse_benchmark -- \
+  --keys 5000000 \
+  --queries 5000000 \
+  --bits 8 \
+  --runs 5
 ```
+
+Key flags:
+
+- `--bits`: fingerprint width (8, 16, or 32).
+- `--runs`: iterations.
+- `--seed`: base RNG seed.
+
+### `zor_hash_query_benchmark`: query cost vs hash count
+
+Compares ZOR query throughput against a fuse baseline as hash count varies.
+
+```
+cargo run --release --example zor_hash_query_benchmark -- \
+  --keys 10000000 \
+  --queries 10000000 \
+  --hashes 4,8,12 \
+  --seed 12345
+```
+
+Key flags:
+
+- `--hashes`: comma-separated hash counts to test.
+- `--keys`: number of keys.
+- `--queries`: number of queries.
+- `--seed`: RNG seed.
+- `--cascade`: add a secondary + aux filter on pure build misses.
+
+### `zor_block_benchmark`: partition count sweep
+
+Builds partitioned filters while varying the number of partitions.
+
+```
+cargo run --release --example zor_block_benchmark -- \
+  --keys 20000000 \
+  --hashes 8 \
+  --partitions 1,2,4,8,16,32
+```
+
+Key flags:
+
+- `--partitions`: comma-separated partition counts to test.
+- `--hashes`: hash counts to test.
+- `--seed`: RNG seed.
+
+### `zor_segment_benchmark`: fixed segment length sweep
+
+Builds complete ZOR filters while varying the segment length.
+
+```
+cargo run --release --example zor_segment_benchmark -- \
+  --keys 10000000 \
+  --hashes 8 \
+  --min-log 6 \
+  --max-log 12
+```
+
+Key flags:
+
+- `--min-log`: smallest segment length as log2.
+- `--max-log`: largest segment length as log2.
+- `--hashes`: hash counts to test.
+- `--seed`: RNG seed.
+
+### `zor_growth_benchmark`: scaling with key count
+
+Builds across powers-of-two key sizes and reports overhead and abandon rates.
+
+```
+cargo run --release --example zor_growth_benchmark -- \
+  --min-exp 20 \
+  --max-exp 26 \
+  --hashes 4,8
+```
+
+Key flags:
+
+- `--min-exp`: smallest key count exponent (2^min-exp).
+- `--max-exp`: largest key count exponent (2^max-exp).
+- `--hashes`: hash counts to test.
+- `--seed`: RNG seed.
+
+### `zor_tiebreak_benchmark`: cycle-break heuristics + tie_scan sweep
+
+Builds with multiple heuristics and tie-scan values to compare abandonment.
+
+```
+cargo run --release --example zor_tiebreak_benchmark -- \
+  --keys 10000000 \
+  --hashes 8
+```
+
+Key flags:
+
+- `--keys`: number of keys.
+- `--hashes`: hash count.
+- `--seed`: RNG seed.
 
 ## Examples directory
 
 More examples and scripts live under `examples/`, including:
 
-- `examples/zor_1m_demo.rs`: 1M-key build/query walkthrough.
+- `examples/zor_demo.rs`: full API walkthrough (complete, pure, segment, partitioned).
 - `examples/random_benchmark.rs`: randomized construction + query benchmark.
 - `examples/false_positive.rs`: detailed build and FP statistics.
+- `examples/optimized_fuse_benchmark.rs`: binary fuse lossless baseline.
+- `examples/zor_hash_query_benchmark.rs`: query throughput vs hash count.
+- `examples/zor_block_benchmark.rs`: partition count sweep.
+- `examples/zor_segment_benchmark.rs`: segment length sweep.
+- `examples/zor_growth_benchmark.rs`: scaling across key counts.
+- `examples/zor_tiebreak_benchmark.rs`: cycle-break heuristic sweep.
 - `examples/bench_common.rs`: shared RNG utilities for benchmarks.
+- `examples/fuse_filter.rs`: auxiliary fuse filter helper used by benchmarks.

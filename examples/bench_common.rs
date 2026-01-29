@@ -26,12 +26,6 @@ pub fn random_keys(count: usize, generator: &mut SplitMix64) -> Vec<u64> {
     keys
 }
 
-pub fn derive_seed(base: u64, run: u64, worker: u64) -> u64 {
-    let mut z = base ^ run.wrapping_mul(0x517C_C1B7_2722_0A95);
-    z ^= worker.wrapping_mul(0x52DC_E729);
-    SplitMix64::new(z).next()
-}
-
 pub fn generate_seed() -> u64 {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
