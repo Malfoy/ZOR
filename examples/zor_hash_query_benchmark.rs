@@ -34,6 +34,7 @@ fn main() {
     let mut num_hashes_list = vec![4usize, 6, 8, 10, 12, 14, 16];
     let mut seed = generate_seed();
     let mut cascade = false;
+    let mut segment_sort = false;
 
     let mut args = env::args().skip(1);
     while let Some(flag) = args.next() {
@@ -53,6 +54,7 @@ fn main() {
             "--hashes" => num_hashes_list = parse_hashes(args.next(), "--hashes"),
             "--seed" => seed = parse(args.next(), "--seed"),
             "--cascade" => cascade = true,
+            "--segment-sort" => segment_sort = true,
             other => panic!("unknown flag: {other}"),
         }
     }
@@ -87,9 +89,20 @@ fn main() {
         FuseFilter::<u8>::build_lossless_with_config(&keys, &fuse_config).expect("fuse build");
     let fuse_filter = fuse_build.filter;
 
+    let fuse_pos_queries = if segment_sort {
+        sort_queries_by_segment_fuse(&pos_queries, &fuse_filter)
+    } else {
+        pos_queries.clone()
+    };
+    let fuse_neg_queries = if segment_sort {
+        sort_queries_by_segment_fuse(&neg_queries, &fuse_filter)
+    } else {
+        neg_queries.clone()
+    };
+
     let fuse_pos_start = Instant::now();
     let mut fuse_pos_hits = 0usize;
-    for &q in &pos_queries {
+    for &q in &fuse_pos_queries {
         if black_box(fuse_filter.contains(q)) {
             fuse_pos_hits += 1;
         }
@@ -98,17 +111,17 @@ fn main() {
 
     let fuse_neg_start = Instant::now();
     let mut fuse_neg_hits = 0usize;
-    for &q in &neg_queries {
+    for &q in &fuse_neg_queries {
         if black_box(fuse_filter.contains(q)) {
             fuse_neg_hits += 1;
         }
     }
     let fuse_neg_time = fuse_neg_start.elapsed().as_secs_f64();
 
-    let fuse_pos_ns = (fuse_pos_time * 1_000_000_000.0) / pos_queries.len() as f64;
-    let fuse_neg_ns = (fuse_neg_time * 1_000_000_000.0) / neg_queries.len() as f64;
-    let fuse_pos_mq = (pos_queries.len() as f64 / fuse_pos_time) / 1_000_000.0;
-    let fuse_neg_mq = (neg_queries.len() as f64 / fuse_neg_time) / 1_000_000.0;
+    let fuse_pos_ns = (fuse_pos_time * 1_000_000_000.0) / fuse_pos_queries.len() as f64;
+    let fuse_neg_ns = (fuse_neg_time * 1_000_000_000.0) / fuse_neg_queries.len() as f64;
+    let fuse_pos_mq = (fuse_pos_queries.len() as f64 / fuse_pos_time) / 1_000_000.0;
+    let fuse_neg_mq = (fuse_neg_queries.len() as f64 / fuse_neg_time) / 1_000_000.0;
 
     println!(
         "fuse4 baseline: pos={:>6.2} Mq/s ({:>6.2} ns/q) neg={:>6.2} Mq/s ({:>6.2} ns/q) pos_hits={} neg_hits={}",
@@ -133,10 +146,20 @@ fn main() {
         let build_time = build_start.elapsed().as_secs_f64();
 
         let filter = &build.filter;
+        let pos_queries_sorted = if segment_sort {
+            sort_queries_by_segment_zor(&pos_queries, filter)
+        } else {
+            pos_queries.clone()
+        };
+        let neg_queries_sorted = if segment_sort {
+            sort_queries_by_segment_zor(&neg_queries, filter)
+        } else {
+            neg_queries.clone()
+        };
 
         let pos_start = Instant::now();
         let mut pos_hits = 0usize;
-        for &q in &pos_queries {
+        for &q in &pos_queries_sorted {
             if black_box(filter.contains(q)) {
                 pos_hits += 1;
             }
@@ -145,7 +168,7 @@ fn main() {
 
         let neg_start = Instant::now();
         let mut neg_hits = 0usize;
-        for &q in &neg_queries {
+        for &q in &neg_queries_sorted {
             if black_box(filter.contains(q)) {
                 neg_hits += 1;
             }
@@ -157,10 +180,10 @@ fn main() {
         let main_abandoned_pct =
             (build.main_abandoned_keys.len() as f64 / key_count as f64) * 100.0;
 
-        let pos_mq = (pos_queries.len() as f64 / pos_time) / 1_000_000.0;
-        let neg_mq = (neg_queries.len() as f64 / neg_time) / 1_000_000.0;
-        let pos_ns = (pos_time * 1_000_000_000.0) / pos_queries.len() as f64;
-        let neg_ns = (neg_time * 1_000_000_000.0) / neg_queries.len() as f64;
+        let pos_mq = (pos_queries_sorted.len() as f64 / pos_time) / 1_000_000.0;
+        let neg_mq = (neg_queries_sorted.len() as f64 / neg_time) / 1_000_000.0;
+        let pos_ns = (pos_time * 1_000_000_000.0) / pos_queries_sorted.len() as f64;
+        let neg_ns = (neg_time * 1_000_000_000.0) / neg_queries_sorted.len() as f64;
 
         println!(
             "hashes={:>2} complete build={:>6.3} s main_abandon={:>7.4}% bits/key={:>7.3} overhead={:>6.2}% pos={:>6.2} Mq/s ({:>6.2} ns/q) neg={:>6.2} Mq/s ({:>6.2} ns/q) pos_hits={} neg_hits={}",
@@ -182,9 +205,19 @@ fn main() {
         let pure_time = pure_start.elapsed().as_secs_f64();
 
         let pure_filter = &pure_build.filter;
+        let pure_pos_queries = if segment_sort {
+            sort_queries_by_segment_zor(&pos_queries, pure_filter)
+        } else {
+            pos_queries.clone()
+        };
+        let pure_neg_queries = if segment_sort {
+            sort_queries_by_segment_zor(&neg_queries, pure_filter)
+        } else {
+            neg_queries.clone()
+        };
         let pure_pos_start = Instant::now();
         let mut pure_pos_hits = 0usize;
-        for &q in &pos_queries {
+        for &q in &pure_pos_queries {
             if black_box(pure_filter.contains(q)) {
                 pure_pos_hits += 1;
             }
@@ -193,7 +226,7 @@ fn main() {
 
         let pure_neg_start = Instant::now();
         let mut pure_neg_hits = 0usize;
-        for &q in &neg_queries {
+        for &q in &pure_neg_queries {
             if black_box(pure_filter.contains(q)) {
                 pure_neg_hits += 1;
             }
@@ -205,10 +238,10 @@ fn main() {
         let pure_abandoned_pct =
             (pure_build.main_abandoned_keys.len() as f64 / key_count as f64) * 100.0;
 
-        let pure_pos_mq = (pos_queries.len() as f64 / pure_pos_time) / 1_000_000.0;
-        let pure_neg_mq = (neg_queries.len() as f64 / pure_neg_time) / 1_000_000.0;
-        let pure_pos_ns = (pure_pos_time * 1_000_000_000.0) / pos_queries.len() as f64;
-        let pure_neg_ns = (pure_neg_time * 1_000_000_000.0) / neg_queries.len() as f64;
+        let pure_pos_mq = (pure_pos_queries.len() as f64 / pure_pos_time) / 1_000_000.0;
+        let pure_neg_mq = (pure_neg_queries.len() as f64 / pure_neg_time) / 1_000_000.0;
+        let pure_pos_ns = (pure_pos_time * 1_000_000_000.0) / pure_pos_queries.len() as f64;
+        let pure_neg_ns = (pure_neg_time * 1_000_000_000.0) / pure_neg_queries.len() as f64;
 
         println!(
             "hashes={:>2} pure     build={:>6.3} s main_abandon={:>7.4}% bits/key={:>7.3} overhead={:>6.2}% pos={:>6.2} Mq/s ({:>6.2} ns/q) neg={:>6.2} Mq/s ({:>6.2} ns/q) pos_hits={} neg_hits={}",
@@ -275,9 +308,19 @@ fn main() {
             let cascade_overhead_pct = (cascade_bits_per_key / 8.0 - 1.0) * 100.0;
 
             let main_filter = pure_filter.main_filter();
+            let cascade_pos_queries = if segment_sort {
+                sort_queries_by_segment_fuse(&pos_queries, main_filter)
+            } else {
+                pos_queries.clone()
+            };
+            let cascade_neg_queries = if segment_sort {
+                sort_queries_by_segment_fuse(&neg_queries, main_filter)
+            } else {
+                neg_queries.clone()
+            };
             let cascade_pos_start = Instant::now();
             let mut cascade_pos_hits = 0usize;
-            for &q in &pos_queries {
+            for &q in &cascade_pos_queries {
                 if black_box(contains_with_cascade(
                     main_filter,
                     secondary_filter.as_ref(),
@@ -291,7 +334,7 @@ fn main() {
 
             let cascade_neg_start = Instant::now();
             let mut cascade_neg_hits = 0usize;
-            for &q in &neg_queries {
+            for &q in &cascade_neg_queries {
                 if black_box(contains_with_cascade(
                     main_filter,
                     secondary_filter.as_ref(),
@@ -303,12 +346,14 @@ fn main() {
             }
             let cascade_neg_time = cascade_neg_start.elapsed().as_secs_f64();
 
-            let cascade_pos_mq = (pos_queries.len() as f64 / cascade_pos_time) / 1_000_000.0;
-            let cascade_neg_mq = (neg_queries.len() as f64 / cascade_neg_time) / 1_000_000.0;
+            let cascade_pos_mq =
+                (cascade_pos_queries.len() as f64 / cascade_pos_time) / 1_000_000.0;
+            let cascade_neg_mq =
+                (cascade_neg_queries.len() as f64 / cascade_neg_time) / 1_000_000.0;
             let cascade_pos_ns =
-                (cascade_pos_time * 1_000_000_000.0) / pos_queries.len() as f64;
+                (cascade_pos_time * 1_000_000_000.0) / cascade_pos_queries.len() as f64;
             let cascade_neg_ns =
-                (cascade_neg_time * 1_000_000_000.0) / neg_queries.len() as f64;
+                (cascade_neg_time * 1_000_000_000.0) / cascade_neg_queries.len() as f64;
             let missed_pct = (missed_keys.len() as f64 / key_count as f64) * 100.0;
 
             println!(
@@ -345,4 +390,22 @@ fn contains_with_cascade(
         return true;
     }
     aux.map_or(false, |filter| filter.contains(key))
+}
+
+fn sort_queries_by_segment_fuse(queries: &[u64], filter: &FuseFilter<u8>) -> Vec<u64> {
+    let mut pairs: Vec<(usize, u64)> = queries
+        .iter()
+        .map(|&q| (filter.segment_index(q), q))
+        .collect();
+    pairs.sort_unstable_by_key(|(segment, _)| *segment);
+    pairs.into_iter().map(|(_, q)| q).collect()
+}
+
+fn sort_queries_by_segment_zor(queries: &[u64], filter: &ZorFilter<u8>) -> Vec<u64> {
+    let mut pairs: Vec<(usize, u64)> = queries
+        .iter()
+        .map(|&q| (filter.segment_index(q), q))
+        .collect();
+    pairs.sort_unstable_by_key(|(segment, _)| *segment);
+    pairs.into_iter().map(|(_, q)| q).collect()
 }

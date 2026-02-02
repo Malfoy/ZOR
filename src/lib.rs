@@ -993,6 +993,33 @@ where
         self.fingerprints.byte_size()
     }
 
+    /// Returns the base segment index for `key` according to the filter layout.
+    pub fn segment_index(&self, key: u64) -> usize {
+        if self.layout.segment_count == 0 {
+            return 0;
+        }
+
+        let hash = match self.hashing {
+            HashingScheme::BinaryFuse => binary_fuse_mix_split(key, self.seed),
+            HashingScheme::SplitMix | HashingScheme::SplitMixFast => mixsplit(key, self.seed),
+        };
+
+        match self.hashing {
+            HashingScheme::BinaryFuse => {
+                let segment_length = self.layout.segment_length as u64;
+                if segment_length == 0 {
+                    return 0;
+                }
+                let h0 = binary_fuse_mulhi(hash, self.layout.segment_count_length as u64);
+                (h0 / segment_length) as usize
+            }
+            HashingScheme::SplitMix | HashingScheme::SplitMixFast => {
+                let segment_count = self.layout.segment_count as u64;
+                (((hash as u128) * (segment_count as u128)) >> 64) as usize
+            }
+        }
+    }
+
     fn build_with_seed(
         keys: &[u64],
         seed: u64,
@@ -2683,6 +2710,18 @@ where
         build_zor_generic::<MainFp>(keys, config, false)
     }
 
+    /// Builds a pure ZOR filter (main layer only) using the supplied configuration and overhead.
+    ///
+    /// The overhead is the target ratio of allocated slots to keys (e.g. 1.10 for 110%).
+    pub fn build_pure_with_overhead(
+        keys: &[u64],
+        config: &FilterConfig,
+        overhead: f64,
+    ) -> Result<ZorBuildOutput<MainFp>, BuildError> {
+        let layout = calculate_layout(keys.len(), config.num_hashes, overhead)?;
+        build_zor_generic_with_layout::<MainFp>(keys, config, false, Some(layout))
+    }
+
     /// Builds partitioned ZOR filters using the supplied configuration.
     pub fn build_partitioned_with_config(
         keys: &[u64],
@@ -2713,6 +2752,11 @@ where
     /// Returns a reference to the remainder filter if one was constructed.
     pub fn remainder_filter(&self) -> Option<&FuseFilter<RemainderOf<MainFp>>> {
         self.remainder.as_ref()
+    }
+
+    /// Returns the base segment index for `key` according to the main filter layout.
+    pub fn segment_index(&self, key: u64) -> usize {
+        self.main.segment_index(key)
     }
 
 }

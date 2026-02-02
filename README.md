@@ -246,6 +246,7 @@ Key flags:
 - `--queries`: number of queries.
 - `--seed`: RNG seed.
 - `--cascade`: add a secondary + aux filter on pure build misses.
+- `--segment-sort`: sort queries by segment before timing queries.
 
 ### `zor_block_benchmark`: partition count sweep
 
