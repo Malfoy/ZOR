@@ -7,16 +7,7 @@ filters, but guarantees that construction never fails by abandoning keys when
 the peeling process blocks. The abandoned keys are then handled explicitly so
 the final structure behaves like a standard false-positive-only filter.
 
-Quick facts:
 
-- Static set of 64-bit keys (hash other key types to `u64`).
-- Complete build has no false negatives; pure build can have false negatives.
-- Main-layer overhead is fixed to 1.0; remainder uses 4-way binary fuse with
-  overhead 1.1 and a fingerprint width of main + 8 bits.
-- Partitioned builds are supported and use Rayon for parallel construction.
-
-Below is a detailed description of the ideas, followed by usage, demos,
-and benchmarks.
 
 ## What is a ZOR filter?
 
@@ -74,28 +65,8 @@ Queries return `present` if any stage matches. This removes false negatives at
 the cost of a small increase in false positives, controlled by the fingerprint
 width in the remainder layer.
 
-### Construction heuristics (cycle breaking)
 
-When a block occurs, the code chooses which key to keep by scoring the set of
-keys that would be abandoned (all other incident keys) based on a heuristic.
-The default is **no heuristic** for maximum build speed.
 
-- `NoHeuristic` (default): keep the first active key in a min-degree cell.
-- `MostDeg2`: maximize degree-2 incidences in the abandoned set.
-- `Lightest`: minimize the total sum of degrees in the abandoned set.
-- `Heaviest`: maximize the total sum of degrees in the abandoned set.
-- `MinMaxDegree`: minimize the maximum incident degree in the abandoned set.
-
-You can select these via `FilterConfig.cycle_break`.
-
-### Fixed parameters
-
-The implementation fixes a few parameters by design:
-
-- Main-layer overhead is always 1.0 (no `overhead` setting in `FilterConfig`).
-- Remainder fingerprint width is always main +8 bits.
-- Remainder uses overhead 1.1 and 4 hash functions.
-- `FilterConfig.tie_scan` defaults to 1.
 
 ### Pure ZOR build (false negatives)
 
