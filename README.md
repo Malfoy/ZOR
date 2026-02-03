@@ -2,14 +2,21 @@
 
 This repository contains a ZOR filter implementation in Rust along with
 benchmarks and examples. A ZOR filter is an always-terminating continuation of
-the fuse filter: it keeps the fast query path and compact memory layout
-of Fuse filters, but guarantees that construction never fails by abandoning
-keys when the peeling process blocks. The abandoned keys are then handled
-explicitly so the final structure behaves like a standard false-positive-only
-filter.
+a fuse filter: it keeps the fast query path and compact memory layout of fuse
+filters, but guarantees that construction never fails by abandoning keys when
+the peeling process blocks. The abandoned keys are then handled explicitly so
+the final structure behaves like a standard false-positive-only filter.
 
-Below is a detailed description of the ideas, followed by build instructions
-and example commands.
+Quick facts:
+
+- Static set of 64-bit keys (hash other key types to `u64`).
+- Complete build has no false negatives; pure build can have false negatives.
+- Main-layer overhead is fixed to 1.0; remainder uses 4-way binary fuse with
+  overhead 1.1 and a fingerprint width of main + 8 bits.
+- Partitioned builds are supported and use Rayon for parallel construction.
+
+Below is a detailed description of the ideas, followed by usage, demos,
+and benchmarks.
 
 ## What is a ZOR filter?
 
@@ -97,29 +104,30 @@ use the pure build: it skips the remainder filter and therefore may return
 false negatives for abandoned keys. Use `ZorFilter::build_pure` or
 `ZorFilter::build_pure_with_config` for this mode.
 
-## How to build the code
+## Using the crate
 
-Run all commands from the repo root (`/home/nadine/Code/ZOR`):
+### Add to Cargo.toml
 
-```
-cargo build
-```
-
-For faster execution (recommended for benchmarks):
+The crate name is `zor_filter`.
 
 ```
-cargo build --release
+[dependencies]
+zor_filter = { path = "/path/to/ZOR" }
 ```
 
-## API quick start
+If you are using a published version, replace the path dependency with a
+version string.
+
+### API quick start
 
 ```rust
-use zor_filter::{CycleBreakHeuristic, FilterConfig, ZorFilter};
+use zor_filter::{CycleBreakHeuristic, FilterConfig, PartitionConfig, ZorFilter};
 
 let keys: Vec<u64> = (0..1_000_000).collect();
 
 // Default complete build (8-bit main / 16-bit remainder).
 let build = ZorFilter::build(&keys).expect("build");
+println!("bytes per key: {:.6}", build.bytes_per_key);
 
 // Custom main-layer configuration.
 let config = FilterConfig {
@@ -132,12 +140,61 @@ let build = ZorFilter::build_with_config(&keys, &config).expect("build");
 
 // Pure build (no remainder, may return false negatives).
 let pure = ZorFilter::build_pure(&keys).expect("build");
+
+// Partitioned build (parallel construction).
+let partitioned = ZorFilter::build_partitioned_with_config(
+    &keys,
+    &PartitionConfig {
+        base: config,
+        target_partition_size: 100_000,
+        partition_seed: 0xD4E9_CB4D_EF64_9B27,
+        max_threads: 0,
+    },
+)
+.expect("build");
+```
+
+### Fingerprint widths
+
+The main ZOR layer can use 8, 16, 24, or 32-bit fingerprints. The type you
+instantiate determines the remainder width (+8 bits). For example:
+
+- `ZorFilter<u8>`: 8-bit main, 16-bit remainder.
+- `ZorFilter<u16>`: 16-bit main, 24-bit remainder.
+- `ZorFilter<Fingerprint24>`: 24-bit main, 32-bit remainder.
+- `ZorFilter<u32>`: 32-bit main, 40-bit remainder.
+
+The default type is `u8`.
+
+### Non-`u64` keys
+
+The filter operates on 64-bit keys. For other types, hash them to a `u64`
+using a stable hash function before building or querying the filter.
+
+## How to build the code
+
+Run all commands from the repo root:
+
+```
+cargo build
+```
+
+For faster execution (recommended for benchmarks):
+
+```
+cargo build --release
+```
+
+Run tests (this also compiles all examples):
+
+```
+cargo test
 ```
 
 ## Demo (start here)
 
 The file `examples/zor_demo.rs` is the kitchen-sink walkthrough. It is heavily
-commented and showcases **all** available ZOR build modes and APIs, including
+commented and showcases all available ZOR build modes and APIs, including
 custom configs, fixed segment length, pure builds, wider fingerprints, and
 partitioned construction.
 
@@ -331,5 +388,5 @@ More examples and scripts live under `examples/`, including:
 - `examples/zor_segment_benchmark.rs`: segment length sweep.
 - `examples/zor_growth_benchmark.rs`: scaling across key counts.
 - `examples/zor_tiebreak_benchmark.rs`: cycle-break heuristic sweep.
-- `examples/bench_common.rs`: shared RNG utilities for benchmarks.
-- `examples/fuse_filter.rs`: auxiliary fuse filter helper used by benchmarks.
+- `examples/support/bench_common.rs`: shared RNG utilities for benchmarks.
+- `examples/support/fuse_filter.rs`: auxiliary fuse filter helper used by benchmarks.

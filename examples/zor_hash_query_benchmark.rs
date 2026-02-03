@@ -2,7 +2,9 @@ use std::env;
 use std::hint::black_box;
 use std::time::Instant;
 
+#[path = "support/bench_common.rs"]
 mod bench_common;
+#[path = "support/fuse_filter.rs"]
 mod fuse_filter;
 
 use bench_common::{generate_seed, random_keys, SplitMix64};

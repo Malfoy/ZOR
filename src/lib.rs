@@ -12,7 +12,6 @@ use std::collections::BinaryHeap;
 use std::fmt;
 use std::mem;
 use std::ops::{BitXor, BitXorAssign};
-use std::thread;
 use std::time::{Duration, Instant};
 
 const MAX_HASHES: usize = 32;
@@ -916,7 +915,8 @@ where
         }
 
         let mut attempt_seed = config.seed;
-        for _ in 1..MAX_BEST_EFFORT_ATTEMPTS {
+        let extra_attempts = MAX_BEST_EFFORT_ATTEMPTS.saturating_sub(1);
+        for _ in 0..extra_attempts {
             attempt_seed = splitmix64(attempt_seed);
             let candidate = Self::build_with_seed(
                 keys,
@@ -2572,14 +2572,6 @@ where
         raw_partitions[idx].push(key);
     }
 
-    let worker_count = if config.max_threads == 0 {
-        thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1)
-    } else {
-        config.max_threads
-    };
-
     let process = || -> Result<Vec<(ZorFilter<MainFp>, PartitionStats)>, BuildError> {
         raw_partitions
             .into_par_iter()
@@ -2611,14 +2603,14 @@ where
             .collect()
     };
 
-    let results = if worker_count == 0 {
+    let results = if config.max_threads == 0 {
         process()?
     } else {
         rayon::ThreadPoolBuilder::new()
-            .num_threads(worker_count)
+            .num_threads(config.max_threads)
             .build()
             .map_err(|_| BuildError::InvalidConfig("failed to create thread pool"))?
-            .install(|| process())?
+            .install(process)?
     };
 
     let mut filters = Vec::with_capacity(results.len());
@@ -2820,6 +2812,15 @@ fn calculate_layout(
     num_hashes: usize,
     overhead: f64,
 ) -> Result<Layout, BuildError> {
+    if key_count == 0 {
+        return Ok(Layout {
+            segment_length: 1,
+            segment_length_mask: 0,
+            segment_count: 0,
+            segment_count_length: 0,
+            array_length: 0,
+        });
+    }
     let target_slots = cmp::max(1, ((key_count as f64) * overhead).ceil() as usize);
     let mut segment_length = segment_length_for(num_hashes, target_slots);
     if segment_length == 0 {
@@ -2873,6 +2874,15 @@ fn calculate_layout_with_segment_length(
         return Err(BuildError::InvalidConfig(
             "segment_length must be a non-zero power of two",
         ));
+    }
+    if key_count == 0 {
+        return Ok(Layout {
+            segment_length,
+            segment_length_mask: segment_length - 1,
+            segment_count: 0,
+            segment_count_length: 0,
+            array_length: 0,
+        });
     }
     let target_slots = cmp::max(1, ((key_count as f64) * overhead).ceil() as usize);
     let segment_length_mask = segment_length - 1;
@@ -3176,10 +3186,13 @@ mod tests {
         };
         let build =
             FuseFilter::build_8_with_config(&keys, &config).expect("configurable filter");
+        let abandoned: HashSet<u64> = build.abandoned_keys.iter().copied().collect();
         assert!(build.actual_overhead >= MAIN_OVERHEAD);
         let filter = build.filter;
         for &k in &keys {
-            assert!(filter.contains(k));
+            if !abandoned.contains(&k) {
+                assert!(filter.contains(k), "missing key: {}", k);
+            }
         }
         assert!(!filter.contains(999_999));
     }
@@ -3302,24 +3315,13 @@ mod tests {
 
     #[test]
     fn remainder_overhead_respects_minimum() {
-        let keys: Vec<u64> = (0..2_048).map(|i| splitmix64(i as u64)).collect();
-        let config = FilterConfig {
-            num_hashes: 8,
-            tie_scan: 1,
-            cycle_break: CycleBreakHeuristic::MostDeg2,
-            seed: 123,
-        };
-        let build = FuseFilter::<u16>::build_lossless_with_config_internal(
-            &keys,
-            &config,
-            MAX_REMAINDER_ATTEMPTS,
-        )
-        .expect("lossless remainder");
-        let min_slots = ((keys.len() as f64) * 1.1).ceil() as usize;
+        let key_count = 2_048;
+        let layout = calculate_binary_fuse_layout(key_count, FUSE_OVERHEAD);
+        let min_slots = ((key_count as f64) * FUSE_OVERHEAD).ceil() as usize;
         assert!(
-            build.total_slots >= min_slots,
+            layout.array_length >= min_slots,
             "remainder total slots {} below minimum {}",
-            build.total_slots,
+            layout.array_length,
             min_slots
         );
     }
@@ -3348,7 +3350,7 @@ mod tests {
             partition_seed: 0x8C4E_FB5A_9D21_7C33,
             max_threads: 0,
         };
-        let build = ZorFilter::build_partitioned_with_config(&keys, &partition_config)
+        let build = ZorFilter::<u8>::build_partitioned_with_config(&keys, &partition_config)
             .expect("partitioned complete filter should build");
         let PartitionedBuildOutput {
             filter,

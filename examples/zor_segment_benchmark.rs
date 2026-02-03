@@ -1,6 +1,7 @@
 use std::env;
 use std::time::Instant;
 
+#[path = "support/bench_common.rs"]
 mod bench_common;
 
 use bench_common::{generate_seed, random_keys, SplitMix64};

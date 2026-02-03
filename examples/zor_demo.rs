@@ -108,6 +108,15 @@ fn main() {
     // Using a dense 0..N range keeps the demo deterministic and easy to verify.
     let keys: Vec<u64> = (0..(key_count as u64)).collect();
 
+    println!("ZOR demo configuration:");
+    println!("  keys: {key_count}");
+    println!("  hashes: {num_hashes}");
+    println!("  seed: 0x{seed:016X}");
+    println!("  segment length: {segment_length}");
+    println!("  partition size: {partition_size}");
+    println!("  partition threads: {partition_threads} (0 = auto)");
+    println!("  scan full set: {scan_full}");
+
     // ---------------------------------------------------------------------
     // Base configuration for the main ZOR layer.
     // ---------------------------------------------------------------------
@@ -179,8 +188,7 @@ fn run_complete_default(keys: &[u64], scan_full: bool) {
 
     // Report build statistics before moving the filter out.
     println!("built in {build_time:?}");
-    println!("main abandoned keys: {}", build.main_abandoned_keys.len());
-    println!("bytes per key: {:.6}", build.bytes_per_key);
+    print_complete_stats(&build);
 
     // Extract the filter so we can query it below.
     let filter = build.filter;
@@ -199,6 +207,10 @@ fn run_complete_default(keys: &[u64], scan_full: bool) {
 // -------------------------------------------------------------------------
 fn run_complete_custom(keys: &[u64], config: &FilterConfig, scan_full: bool) {
     println!("\n=== Complete build (custom FilterConfig) ===");
+    println!(
+        "config: num_hashes={}, tie_scan={}, cycle_break={:?}, seed=0x{:016X}",
+        config.num_hashes, config.tie_scan, config.cycle_break, config.seed
+    );
 
     // Build a complete filter with explicit config values.
     let build_start = Instant::now();
@@ -207,8 +219,7 @@ fn run_complete_custom(keys: &[u64], config: &FilterConfig, scan_full: bool) {
     let build_time = build_start.elapsed();
 
     println!("built in {build_time:?}");
-    println!("main abandoned keys: {}", build.main_abandoned_keys.len());
-    println!("bytes per key: {:.6}", build.bytes_per_key);
+    print_complete_stats(&build);
 
     // Pull out the filter and show how to access its two layers.
     let filter = build.filter;
@@ -242,8 +253,7 @@ fn run_complete_segment(keys: &[u64], config: &FilterConfig, segment_length: usi
 
     println!("segment length: {segment_length}");
     println!("built in {build_time:?}");
-    println!("main abandoned keys: {}", build.main_abandoned_keys.len());
-    println!("bytes per key: {:.6}", build.bytes_per_key);
+    print_complete_stats(&build);
 }
 
 // -------------------------------------------------------------------------
@@ -254,18 +264,31 @@ fn run_pure_builds(keys: &[u64], config: &FilterConfig) {
 
     // Pure build using default configuration.
     let default_build = ZorFilter::build_pure(keys).expect("pure build should succeed");
-    println!("pure default abandoned keys: {}", default_build.main_abandoned_keys.len());
+    let default_abandoned = default_build.main_abandoned_keys.len();
+    println!("pure default abandoned keys: {default_abandoned}");
 
     // Pure build using a custom configuration.
     let custom_build = ZorFilter::<u8>::build_pure_with_config(keys, config)
         .expect("pure build with config should succeed");
-    println!(
-        "pure custom abandoned keys: {}",
-        custom_build.main_abandoned_keys.len()
-    );
+    let custom_abandoned = custom_build.main_abandoned_keys.len();
+    println!("pure custom abandoned keys: {custom_abandoned}");
 
     // Note: a pure filter can return false negatives for abandoned keys.
     let filter = custom_build.filter;
+    let mut missed = 0usize;
+    let mut sample_miss = None;
+    for &key in &custom_build.main_abandoned_keys {
+        if !filter.contains(key) {
+            missed += 1;
+            if sample_miss.is_none() {
+                sample_miss = Some(key);
+            }
+        }
+    }
+    println!("pure custom missed keys: {missed}");
+    if let Some(key) = sample_miss {
+        println!("sample missed key: {key}");
+    }
     demo_queries(&filter, keys.len());
 }
 
@@ -282,8 +305,7 @@ fn run_wide_main(keys: &[u64], config: &FilterConfig) {
     let build_time = build_start.elapsed();
 
     println!("built in {build_time:?}");
-    println!("main abandoned keys: {}", build.main_abandoned_keys.len());
-    println!("bytes per key: {:.6}", build.bytes_per_key);
+    print_complete_stats(&build);
 }
 
 // -------------------------------------------------------------------------
@@ -317,6 +339,12 @@ fn run_partitioned_builds(
         "default partition stats entries: {}",
         default_build.partition_stats.len()
     );
+    if let Some(stats) = default_build.partition_stats.first() {
+        println!(
+            "default partition[0]: keys={}, abandoned={}, bytes per key={:.6}",
+            stats.key_count, stats.main_abandoned_keys, stats.bytes_per_key
+        );
+    }
 
     // Partitioned build with explicit partition tuning.
     let partition_config = PartitionConfig {
@@ -362,6 +390,27 @@ fn run_partitioned_builds(
             partitioned_filter.contains(sample_key)
         );
     }
+}
+
+fn print_complete_stats<MainFp>(build: &zor_filter::ZorBuildOutput<MainFp>)
+where
+    MainFp: zor_filter::FingerprintValue + zor_filter::RemainderFingerprint,
+    zor_filter::RemainderOf<MainFp>: zor_filter::FingerprintValue,
+{
+    println!("main abandoned keys: {}", build.main_abandoned_keys.len());
+    println!("main total slots: {}", build.main_total_slots);
+    println!("main actual overhead: {:.6}", build.main_actual_overhead);
+    match (build.remainder_total_slots, build.remainder_actual_overhead) {
+        (Some(slots), Some(overhead)) => {
+            println!("remainder total slots: {slots}");
+            println!("remainder actual overhead: {:.6}", overhead);
+        }
+        _ => {
+            println!("remainder total slots: 0");
+            println!("remainder actual overhead: 0.000000");
+        }
+    }
+    println!("bytes per key: {:.6}", build.bytes_per_key);
 }
 
 // -------------------------------------------------------------------------

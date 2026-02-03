@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[path = "support/fuse_filter.rs"]
 mod fuse_filter;
 
 use fuse_filter::{AuxFuseConfig, AuxFuseFilter};
